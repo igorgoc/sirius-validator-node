@@ -9,7 +9,7 @@ const grpc = require('@grpc/grpc-js');
 const protoLoader = require('@grpc/proto-loader');
 
 const PROTO_PATH = path.join(__dirname, '../executor/proto/supercontract_server.proto');
-const PORT = process.env.VM_PORT || 5051;
+const PORT = parseInt(process.argv[2] || process.env.VM_PORT || '5051', 10);
 const HOST = process.env.HEALTHCHECK_HOST || '127.0.0.1';
 
 const packageDefinition = protoLoader.loadSync(PROTO_PATH, {

@@ -18,9 +18,16 @@ const CONTRACTS_DIR = process.env.CONTRACTS_DIR || path.join(ROOT_DIR, 'contract
 const PROTO_DIR = path.join(__dirname, 'proto');
 const PROTO_PATH = path.join(PROTO_DIR, 'supercontract_server.proto');
 
-function verifyVmAuthMetadata(callOrStream) {
+function verifyVmAuthMetadata(callOrStream, bindAddress = '') {
   const expectedToken = process.env.SIRIUS_VM_AUTH_TOKEN;
-  if (!expectedToken) return true; // Open mode if token is not configured
+  const isLoopbackOnly = bindAddress.startsWith('127.0.0.1') || bindAddress.startsWith('localhost');
+  if (!expectedToken) {
+    if (process.env.NODE_ENV === 'production' || (!isLoopbackOnly && bindAddress)) {
+      console.error('[SECURITY] Rejected unauthenticated call: SIRIUS_VM_AUTH_TOKEN is required when exposed to non-loopback network');
+      return false;
+    }
+    return true; // Dev mode on loopback only
+  }
   const metaVals = callOrStream && callOrStream.metadata ? callOrStream.metadata.get('x-sirius-vm-token') : [];
   const provided = String((metaVals && metaVals[0]) || '');
   const a = Buffer.from(provided, 'utf8');
@@ -41,6 +48,14 @@ function validateWasmFileToCall(filePath) {
     }
   }
 
+  // Strict path containment & extension validation
+  const contractsRoot = CONTRACTS_DIR.endsWith(path.sep) ? CONTRACTS_DIR : CONTRACTS_DIR + path.sep;
+  if (!resolved.startsWith(contractsRoot)) {
+    throw new Error(`Security rejection: WASM binary (${filePath}) must reside inside authorized contracts directory: ${CONTRACTS_DIR}`);
+  }
+  if (!resolved.endsWith('.wasm')) {
+    throw new Error(`Security rejection: Only .wasm WebAssembly binaries are permitted`);
+  }
   if (!fs.existsSync(resolved)) {
     throw new Error(`Security rejection: WASM binary does not exist at ${resolved}`);
   }
@@ -88,6 +103,29 @@ async function getCompiledWasmModule(wasmPath) {
   return compiledModule;
 }
 
+function normalizeClientMessage(msg) {
+  if (Array.isArray(msg)) {
+    return msg.map((item) => {
+      if (Buffer.isBuffer(item)) return item.toString('base64');
+      if (item && typeof item === 'object') return normalizeClientMessage(item);
+      return item;
+    });
+  }
+  const out = {};
+  for (const [k, v] of Object.entries(msg)) {
+    if (Buffer.isBuffer(v)) {
+      out[k] = v.toString('base64');
+    } else if (Array.isArray(v)) {
+      out[k] = normalizeClientMessage(v);
+    } else if (v && typeof v === 'object') {
+      out[k] = normalizeClientMessage(v);
+    } else {
+      out[k] = v;
+    }
+  }
+  return out;
+}
+
 function prepareServerMessage(msg) {
   const clone = { ...msg };
   if (clone.storage_read && clone.storage_read.drive_key) {
@@ -102,7 +140,7 @@ function prepareServerMessage(msg) {
 function createSupercontractService(nodeName, bindAddress) {
   return {
     Ping: (call, callback) => {
-      if (!verifyVmAuthMetadata(call)) {
+      if (!verifyVmAuthMetadata(call, bindAddress)) {
         return callback({ code: grpc.status.UNAUTHENTICATED, details: 'Unauthorized: invalid VM auth token' });
       }
       callback(null, {
@@ -111,7 +149,7 @@ function createSupercontractService(nodeName, bindAddress) {
     },
 
     ExecuteCall: (stream) => {
-      if (!verifyVmAuthMetadata(stream)) {
+      if (!verifyVmAuthMetadata(stream, bindAddress)) {
         stream.emit('error', { code: grpc.status.UNAUTHENTICATED, details: 'Unauthorized: invalid VM auth token' });
         return;
       }
@@ -230,27 +268,20 @@ function createSupercontractService(nodeName, bindAddress) {
             stream.end();
           });
         } else {
-          // Handle client responses for host calls (storage read, drive saves)
-          let payloadBytes = Buffer.alloc(0);
-          let isError = false;
-
-          if (clientMsg.storage_read) {
-            payloadBytes = clientMsg.storage_read.content || Buffer.alloc(0);
-          } else if (clientMsg.storage_save) {
-            payloadBytes = Buffer.alloc(0);
-          } else if (clientMsg.error) {
-            isError = true;
-          }
-
-          if (control && dataBuffer) {
-            if (isError) {
-              Atomics.store(control, 1, 0);
+          // 2. Host call reply from C++ Executor / Gateway -> wake up blocked WASM worker via Atomics.notify()
+          if (worker && control) {
+            const normalized = normalizeClientMessage(clientMsg);
+            const jsonBytes = Buffer.from(JSON.stringify(normalized), 'utf8');
+            if (jsonBytes.length > dataBuffer.length) {
+              const errBytes = Buffer.from('IPC response exceeded SharedArrayBuffer capacity', 'utf8');
+              const copyLen = Math.min(errBytes.length, dataBuffer.length);
+              errBytes.copy(dataBuffer, 0, 0, copyLen);
+              Atomics.store(control, 1, copyLen);
               Atomics.store(control, 0, -1);
             } else {
-              const maxCopy = Math.min(payloadBytes.length, dataBuffer.length);
-              payloadBytes.copy(dataBuffer, 0, 0, maxCopy);
-              Atomics.store(control, 1, maxCopy);
-              Atomics.store(control, 0, 2); // Response ready
+              jsonBytes.copy(dataBuffer, 0);
+              Atomics.store(control, 1, jsonBytes.length);
+              Atomics.store(control, 0, 2); // 2 = response ready
             }
             Atomics.notify(control, 0, 1);
           }

@@ -54,19 +54,22 @@ mkdir -p data/drives data/logs config contracts
 # Setup node.env if not present
 if [ ! -f "config/node.env" ]; then
   echo "⚙️  4. Generating config/node.env..."
+  RAND_TOKEN=$(openssl rand -hex 32 2>/dev/null || node -e "console.log(require('crypto').randomBytes(32).toString('hex'))")
   if [ -f "config/node.env.example" ]; then
     cp config/node.env.example config/node.env
+    sed -i.bak "s/^SIRIUS_VM_AUTH_TOKEN=.*/SIRIUS_VM_AUTH_TOKEN=${RAND_TOKEN}/" config/node.env && rm -f config/node.env.bak
   else
     cat <<EOF > config/node.env
 NODE_NAME="node-$(hostname)"
 NODE_PORT=5051
 SIRIUS_VM_BIND_HOST=0.0.0.0
-SIRIUS_VM_AUTH_TOKEN=$(openssl rand -hex 32)
+SIRIUS_VM_AUTH_TOKEN=${RAND_TOKEN}
 SIRIUS_NETWORK=testnet2
 SIRIUS_RPC_URL=https://api-2.testnet2.xpxsirius.io
 DRIVE_KEY_HEX=bd1d100a98c34f62e170a8395b4498dc1e730286f5a12c489b37d01562f0cb23
 EOF
   fi
+  chmod 600 config/node.env
   echo "🔑 Generated random node authentication token in config/node.env."
 fi
 
