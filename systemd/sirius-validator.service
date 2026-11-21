@@ -1,0 +1,23 @@
+[Unit]
+Description=Sirius SuperContract Validator Node Daemon
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sirius
+Group=sirius
+WorkingDirectory=/opt/sirius-validator-node
+EnvironmentFile=/opt/sirius-validator-node/config/node.env
+ExecStart=/usr/bin/node executor/grpc_vm_server.js
+Restart=always
+RestartSec=5
+LimitNOFILE=65536
+
+# Security Sandboxing
+ProtectSystem=full
+ProtectHome=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

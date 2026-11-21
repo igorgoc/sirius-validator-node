@@ -1,0 +1,27 @@
+{
+  "name": "sirius-validator-node",
+  "version": "1.0.0",
+  "description": "Production Replicator & SuperContract Validator Node for ProximaX Sirius CLOB Cluster",
+  "main": "executor/grpc_vm_server.js",
+  "scripts": {
+    "start": "node executor/grpc_vm_server.js",
+    "healthcheck": "node scripts/healthcheck.js"
+  },
+  "keywords": [
+    "proximax",
+    "sirius",
+    "supercontract",
+    "wasm",
+    "bft",
+    "validator"
+  ],
+  "author": "ProximaX Sirius Team",
+  "license": "Apache-2.0",
+  "dependencies": {
+    "@grpc/grpc-js": "^1.10.9",
+    "@grpc/proto-loader": "^0.7.13"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

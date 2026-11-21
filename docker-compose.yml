@@ -1,0 +1,34 @@
+version: '3.8'
+
+services:
+  validator-node:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: sirius-validator-node:latest
+    container_name: sirius-validator-${NODE_NAME:-node1}
+    restart: unless-stopped
+    env_file:
+      - ./config/node.env
+    environment:
+      - VM_PORT=${NODE_PORT:-5051}
+      - NODE_NAME=${NODE_NAME:-node1}
+      - SIRIUS_VM_BIND_HOST=0.0.0.0
+      - SIRIUS_VM_AUTH_TOKEN=${SIRIUS_VM_AUTH_TOKEN:-}
+      - SIRIUS_NETWORK=${SIRIUS_NETWORK:-testnet2}
+    ports:
+      - "${NODE_PORT:-5051}:5051"
+    volumes:
+      - ./data/drives:/app/data/drives
+      - ./data/logs:/app/data/logs
+      - ./contracts:/app/contracts
+    healthcheck:
+      test: ["CMD", "node", "scripts/healthcheck.js"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"

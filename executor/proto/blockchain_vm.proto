@@ -1,0 +1,78 @@
+syntax = "proto3";
+
+package supercontractserver;
+
+message GetBlockHeight {
+}
+
+message GetBlockHeightReturn {
+  uint64 height = 1;
+}
+
+message GetBlockHash {
+}
+
+message GetBlockHashReturn {
+  bytes hash = 1;
+}
+
+message GetBlockTime {
+}
+
+message GetBlockTimeReturn {
+  uint64 timestamp = 1;
+}
+
+message GetBlockGenerationTime {
+}
+
+message GetBlockGenerationTimeReturn {
+  uint64 delta = 1;
+}
+
+message GetTransactionHash {
+}
+
+message GetTransactionHashReturn {
+  bytes hash = 1;
+}
+
+message GetCallerPublicKey {
+}
+
+message GetCallerPublicKeyReturn {
+  bytes public_key = 1;
+}
+
+message GetContractPublicKey {
+}
+
+message GetContractPublicKeyReturn {
+  bytes public_key = 1;
+}
+
+message GetServicePayments {
+}
+
+message ServicePayment {
+  uint64 mosaic_id = 1;
+  uint64 amount = 2;
+}
+
+message GetServicePaymentsReturn {
+  repeated ServicePayment payments = 1;
+}
+
+message GetExecutionPayment {
+}
+
+message GetExecutionPaymentReturn {
+  uint64 amount = 1;
+}
+
+message GetDownloadPayment {
+}
+
+message GetDownloadPaymentReturn {
+  uint64 amount = 1;
+}
