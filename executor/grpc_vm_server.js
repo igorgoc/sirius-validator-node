@@ -100,17 +100,212 @@ function readNodeDriveBalances(ownerKeyHex) {
   try {
     const balancesPath = path.join(DRIVES_DIR, DRIVE_KEY_HEX, 'drive', 'markets', 'balances.json');
     if (!fs.existsSync(balancesPath)) return null;
-    const data = JSON.parse(fs.readFileSync(balancesPath, 'utf8'));
-    if (!data || !Array.isArray(data.accounts)) return null;
+    const raw = fs.readFileSync(balancesPath, 'utf8');
+    const safeRaw = raw.replace(/:\s*(\d{10,})/g, ':"$1"');
+    const data = JSON.parse(safeRaw);
+    const list = Array.isArray(data.entries) ? data.entries : (Array.isArray(data.accounts) ? data.accounts : null);
+    if (!list) return null;
     const norm = String(ownerKeyHex || '').toLowerCase();
-    const entry = data.accounts.find((a) => Buffer.from(a.pubkey || []).toString('hex').toLowerCase() === norm);
-    return entry || null;
+    const locked = {};
+    let matched = false;
+    for (const e of list) {
+      const pkHex = e.pubkey_hex
+        ? String(e.pubkey_hex).toLowerCase()
+        : Buffer.from(e.pubkey || []).toString('hex').toLowerCase();
+      if (pkHex !== norm) continue;
+      matched = true;
+      if (e.locked && typeof e.locked === 'object') {
+        Object.assign(locked, e.locked);
+      } else if (e.mosaic_id !== undefined) {
+        const mDec = String(e.mosaic_id);
+        locked[mDec] = (BigInt(locked[mDec] || '0') + BigInt(e.locked_amount || '0')).toString();
+      }
+    }
+    return matched ? { locked } : null;
   } catch (_) {
     return null;
   }
 }
 
-function verifyAndCosignOnNode(nodeName, req) {
+function getCanonicalL1Urls(networkType) {
+  const isMainnet = Number(networkType) === 184;
+  const envUrl = (process.env.SIRIUS_NODE_URL || '').trim().replace(/\/+$/, '');
+  const defaults = isMainnet
+    ? ['https://betelgeuse.xpxsirius.io', 'https://arcturus.xpxsirius.io', 'https://aldebaran.xpxsirius.io']
+    : ['https://api-2.testnet2.xpxsirius.io', 'https://api-1.testnet2.xpxsirius.io'];
+  return Array.from(new Set([envUrl, ...defaults].filter(Boolean)));
+}
+
+async function fetchSiriusL1Mosaics(publicKeyHex, networkType) {
+  const sdk = getXpxSdk();
+  const addr = sdk.Address.createFromPublicKey(String(publicKeyHex), Number(networkType)).plain();
+  const urls = getCanonicalL1Urls(networkType);
+  let lastErr = null;
+  for (const baseUrl of urls) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 3500);
+    try {
+      const res = await fetch(`${baseUrl}/account/${addr}`, { signal: controller.signal });
+      clearTimeout(timer);
+      if (res.status === 404) {
+        return new Map();
+      }
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status}`);
+      }
+      const json = await res.json();
+      const map = new Map();
+      const mosaics = (json && json.account && Array.isArray(json.account.mosaics)) ? json.account.mosaics : [];
+      for (const m of mosaics) {
+        let hex = '';
+        if (Array.isArray(m.id) && m.id.length === 2) {
+          const lo = (m.id[0] >>> 0).toString(16).padStart(8, '0');
+          const hi = (m.id[1] >>> 0).toString(16).padStart(8, '0');
+          hex = (hi + lo).toUpperCase();
+        } else if (typeof m.id === 'string') {
+          hex = m.id.toUpperCase().replace(/^0X/, '');
+        }
+        let amt = 0n;
+        if (Array.isArray(m.amount) && m.amount.length === 2) {
+          amt = BigInt(m.amount[0] >>> 0) + (BigInt(m.amount[1] >>> 0) << 32n);
+        } else if (m.amount !== undefined) {
+          amt = BigInt(m.amount);
+        }
+        if (hex) map.set(hex, amt);
+      }
+      return map;
+    } catch (err) {
+      clearTimeout(timer);
+      lastErr = err;
+    }
+  }
+  throw new Error(`L1 verification failed for ${addr}: ${lastErr ? lastErr.message : 'unreachable'}`);
+}
+
+function getMosaicSpecForAsset(networkType) {
+  const isMainnet = Number(networkType) === 184;
+  return {
+    XPX: isMainnet ? '402B2F579FAEBC59' : '13BFC518E40549D7',
+    USDT: isMainnet ? '7525381A171D1E44' : '4430AEFEF7E15D0C',
+    BNB: isMainnet ? '1E5C5FADEC7B34DD' : '3CC1D3CE7447B6F9',
+    WASM_DEC_BY_HEX: isMainnet
+      ? {
+          '402B2F579FAEBC59': '992621222383397347',
+          '7525381A171D1E44': '1157755757097881655',
+          '1E5C5FADEC7B34DD': '2187725993354835165',
+        }
+      : {
+          '13BFC518E40549D7': '992621222383397347',
+          '4430AEFEF7E15D0C': '1157755757097881655',
+          '3CC1D3CE7447B6F9': '2187725993354835165',
+        },
+  };
+}
+
+function parseDecimalToBigIntValidator(valStr, decimals) {
+  const clean = String(valStr || '0').trim();
+  const [intPart, fracPart = ''] = clean.split('.');
+  const paddedFrac = (fracPart + '0'.repeat(decimals)).slice(0, decimals);
+  return BigInt((intPart.replace(/[^0-9]/g, '') || '0') + paddedFrac);
+}
+
+function verifySettlementAgainstOrderContext(nodeName, tx, callerPub, tradingPub, metadata, networkType) {
+  const ctx = metadata && metadata.orderContext;
+  if (!ctx || !ctx.signature) return;
+
+  const sdk = getXpxSdk();
+  const { KeyPair, DerivationScheme, Address } = sdk;
+  const signerPub = String(ctx.publicKey || callerPub || '').toUpperCase();
+  if (!signerPub || signerPub.length !== 64) {
+    throw new Error(`Security rejection on ${nodeName}: invalid orderContext publicKey`);
+  }
+  const domainSep = String(ctx.domainSeparator || `${networkType}:SiriusCLOB-v1`);
+  const normPair = String(ctx.pair || 'XPX/USDT').toUpperCase().replace('_', '/');
+  const normSide = String(ctx.side || '').toLowerCase() === 'sell' ? 'sell' : 'buy';
+  const normType = String(ctx.type || '') === 'Market' ? 'Market' : 'Limit';
+  const msg = `${domainSep}:ORDER:${normPair}:${normSide}:${normType}:${String(ctx.price)}:${String(ctx.amount)}:${ctx.nonce}:${ctx.expiry}`;
+
+  const sigValid = KeyPair.verify(
+    Buffer.from(signerPub, 'hex'),
+    Buffer.from(msg, 'utf8'),
+    Buffer.from(String(ctx.signature), 'hex'),
+    DerivationScheme.Ed25519Sha3
+  );
+  if (!sigValid) {
+    throw new Error(`Security rejection on ${nodeName}: forged or invalid user order signature in settlement`);
+  }
+
+  if (!tradingPub) return;
+  const tradingAddr = Address.createFromPublicKey(tradingPub, Number(networkType)).plain().replace(/[- ]/g, '').toUpperCase();
+  const specs = getMosaicSpecForAsset(networkType);
+  const xpxHex = specs.XPX;
+  const quoteHex = normPair.endsWith('/BNB') ? specs.BNB : specs.USDT;
+
+  const outByHex = new Map();
+  const inByHex = new Map();
+  for (const inner of tx.innerTransactions) {
+    const sPub = inner.signer ? inner.signer.publicKey.toUpperCase() : '';
+    const recipObj = inner.recipient || inner.recipientAddress;
+    const rAddr = recipObj && typeof recipObj.plain === 'function' ? recipObj.plain().replace(/[- ]/g, '').toUpperCase() : '';
+    for (const m of (inner.mosaics || [])) {
+      const mHex = m.id.toHex().toUpperCase();
+      const amt = BigInt(m.amount.compact ? m.amount.compact() : m.amount);
+      if (sPub === tradingPub) outByHex.set(mHex, (outByHex.get(mHex) || 0n) + amt);
+      if (rAddr === tradingAddr) inByHex.set(mHex, (inByHex.get(mHex) || 0n) + amt);
+    }
+  }
+
+  const orderAmtAtomic = parseDecimalToBigIntValidator(ctx.amount, 6);
+  const limitPriceTicks = parseDecimalToBigIntValidator(ctx.price, 8);
+  const PRICE_SCALE = 100_000_000n;
+
+  const outXpx = outByHex.get(xpxHex) || 0n;
+  const outQuote = outByHex.get(quoteHex) || 0n;
+  const inXpx = inByHex.get(xpxHex) || 0n;
+  const inQuote = inByHex.get(quoteHex) || 0n;
+
+  for (const [hex] of outByHex.entries()) {
+    if (hex !== xpxHex && hex !== quoteHex) {
+      throw new Error(`Security rejection on ${nodeName}: unexpected mosaic ${hex} leaving Trading Account`);
+    }
+  }
+
+  if (normSide === 'buy') {
+    if (outXpx > 0n) {
+      throw new Error(`Security rejection on ${nodeName}: BUY settlement cannot send XPX out of Trading Account`);
+    }
+    const maxQuoteBase = (orderAmtAtomic * limitPriceTicks + PRICE_SCALE - 1n) / PRICE_SCALE;
+    const maxQuoteWithFee = (maxQuoteBase * 102n) / 100n + 1000n;
+    if (outQuote > maxQuoteWithFee) {
+      throw new Error(`Security rejection on ${nodeName}: BUY quote outflow ${outQuote} exceeds signed limit ${maxQuoteWithFee}`);
+    }
+    if (outQuote > 0n && inXpx === 0n) {
+      throw new Error(`Security rejection on ${nodeName}: BUY settlement sends quote without delivering XPX`);
+    }
+    if (inXpx > 0n && outQuote > 0n) {
+      const maxCostForFill = ((inXpx * limitPriceTicks + PRICE_SCALE - 1n) / PRICE_SCALE) * 102n / 100n + 1000n;
+      if (outQuote > maxCostForFill) {
+        throw new Error(`Security rejection on ${nodeName}: BUY execution cost ${outQuote} exceeds signed limit price`);
+      }
+    }
+  } else {
+    if (outQuote > 0n) {
+      throw new Error(`Security rejection on ${nodeName}: SELL settlement cannot send quote out of Trading Account`);
+    }
+    const maxXpxWithFee = (orderAmtAtomic * 102n) / 100n + 1000n;
+    if (outXpx > maxXpxWithFee) {
+      throw new Error(`Security rejection on ${nodeName}: SELL XPX outflow ${outXpx} exceeds signed amount ${maxXpxWithFee}`);
+    }
+    if (outXpx > 0n && limitPriceTicks > 0n) {
+      const expectedQuoteRaw = (outXpx * limitPriceTicks) / PRICE_SCALE;
+      if (expectedQuoteRaw >= 100n && inQuote < (expectedQuoteRaw * 97n) / 100n) {
+        throw new Error(`Security rejection on ${nodeName}: SELL quote received ${inQuote} below signed limit floor`);
+      }
+    }
+  }
+}
+
+async function verifyAndCosignOnNode(nodeName, req) {
   const sdk = getXpxSdk();
   const {
     TransactionMapping,
@@ -221,23 +416,34 @@ function verifyAndCosignOnNode(nodeName, req) {
       }
     }
 
-    const driveAcc = readNodeDriveBalances(callerPub);
-    for (const c of checks) {
-      const mKey = String(c.mosaicHex || '').toUpperCase();
-      if (!mKey) continue;
-      const outAmt = totalOutgoingByMosaic.get(mKey) || 0n;
-      const checkMax = c.maxWithdrawableAtomic != null ? BigInt(c.maxWithdrawableAtomic) : null;
-      if (checkMax !== null && outAmt > checkMax) {
-        throw new Error(`Security rejection on ${nodeName}: requested withdrawal ${outAmt} (${mKey}) exceeds verified free balance ${checkMax}`);
+    const networkType = Number(process.env.SIRIUS_NETWORK_TYPE || (String(process.env.SIRIUS_NETWORK || '').toLowerCase() === 'mainnet' ? 184 : 168));
+    const specs = getMosaicSpecForAsset(networkType);
+    let l1Mosaics = null;
+    try {
+      l1Mosaics = await fetchSiriusL1Mosaics(tradingPub, networkType);
+    } catch (l1Err) {
+      if (process.env.SIRIUS_VALIDATOR_OFFLINE_FALLBACK !== 'true') {
+        throw new Error(`Security rejection on ${nodeName}: ${l1Err.message}`);
       }
-      if (driveAcc && c.onChainBalanceAtomic && c.mosaicIdDecimal) {
-        const mDec = String(c.mosaicIdDecimal);
-        const lockedInDrive = BigInt((driveAcc.locked && driveAcc.locked[mDec]) || '0');
-        const onChainAmt = BigInt(c.onChainBalanceAtomic);
-        const driveFree = onChainAmt > lockedInDrive ? onChainAmt - lockedInDrive : 0n;
-        const requested = c.requestedAmountAtomic ? BigInt(c.requestedAmountAtomic) : outAmt;
-        if (requested > driveFree) {
-          throw new Error(`BFT lock check rejected on ${nodeName}: ${requested} > free ${driveFree} (locked=${lockedInDrive})`);
+    }
+
+    const driveAcc = readNodeDriveBalances(callerPub);
+    for (const [mKey, outAmt] of totalOutgoingByMosaic.entries()) {
+      const checkItem = checks.find((c) => String(c.mosaicHex || '').toUpperCase() === mKey);
+      if (l1Mosaics) {
+        const l1OnChain = l1Mosaics.get(mKey) || 0n;
+        const wasmDec = specs.WASM_DEC_BY_HEX[mKey] || (checkItem && checkItem.mosaicIdDecimal ? String(checkItem.mosaicIdDecimal) : '');
+        const lockedInDrive = (driveAcc && wasmDec) ? BigInt((driveAcc.locked && driveAcc.locked[wasmDec]) || '0') : 0n;
+        const validatorFree = l1OnChain > lockedInDrive ? l1OnChain - lockedInDrive : 0n;
+        if (outAmt > validatorFree) {
+          throw new Error(
+            `L1/Drive balance check rejected on ${nodeName}: requested ${outAmt} (${mKey}) > free ${validatorFree} (L1=${l1OnChain}, locked=${lockedInDrive})`
+          );
+        }
+      } else if (checkItem) {
+        const checkMax = checkItem.maxWithdrawableAtomic != null ? BigInt(checkItem.maxWithdrawableAtomic) : null;
+        if (checkMax !== null && outAmt > checkMax) {
+          throw new Error(`Security rejection on ${nodeName}: requested withdrawal ${outAmt} (${mKey}) exceeds verified free balance ${checkMax}`);
         }
       }
     }
@@ -254,6 +460,8 @@ function verifyAndCosignOnNode(nodeName, req) {
         throw new Error(`Security rejection: Unexpected settlement inner signer ${signerPk}`);
       }
     }
+    const settlementNetType = Number(process.env.SIRIUS_NETWORK_TYPE || (String(process.env.SIRIUS_NETWORK || '').toLowerCase() === 'mainnet' ? 184 : 168));
+    verifySettlementAgainstOrderContext(nodeName, tx, callerPub, tradingPub, metadata, settlementNetType);
   } else {
     throw new Error(`Unsupported cosign action: ${action}`);
   }
@@ -410,21 +618,22 @@ function createSupercontractService(nodeName, bindAddress) {
       if (!verifyVmAuthMetadata(call, bindAddress)) {
         return callback({ code: grpc.status.UNAUTHENTICATED, details: 'Unauthorized: invalid VM auth token' });
       }
-      try {
-        const reply = verifyAndCosignOnNode(nodeName, call.request || {});
-        console.log(`[${nodeName} VM] ✍️ BFT Cosigned ${call.request.action} (${reply.signer_public_key.slice(0, 12)}...)`);
-        callback(null, reply);
-      } catch (err) {
-        console.warn(`[${nodeName} VM] ⛔ CosignTransaction rejected (${call.request && call.request.action}): ${err.message}`);
-        callback(null, {
-          approved: false,
-          error: err.message,
-          node_name: nodeName,
-          signer_public_key: '',
-          parent_hash: '',
-          signature: '',
+      verifyAndCosignOnNode(nodeName, call.request || {})
+        .then((reply) => {
+          console.log(`[${nodeName} VM] ✍️ BFT Cosigned ${call.request.action} (${reply.signer_public_key.slice(0, 12)}...)`);
+          callback(null, reply);
+        })
+        .catch((err) => {
+          console.warn(`[${nodeName} VM] ⛔ CosignTransaction rejected (${call.request && call.request.action}): ${err.message}`);
+          callback(null, {
+            approved: false,
+            error: err.message,
+            node_name: nodeName,
+            signer_public_key: '',
+            parent_hash: '',
+            signature: '',
+          });
         });
-      }
     },
 
     ExecuteCall: (stream) => {
