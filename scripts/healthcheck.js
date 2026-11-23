@@ -50,6 +50,7 @@ client.Ping({ name: 'healthcheck' }, metadata, { deadline }, (err, response) => 
     console.warn(`⚠️ Warning: sirius_clob.wasm not found at ${wasmPath}`);
   }
 
-  console.log(`✅ Healthcheck PASSED: ${response.message}`);
+  const keyNote = response.validator_public_key ? ` [Cosigner: ${response.validator_public_key.slice(0, 12)}...]` : '';
+  console.log(`✅ Healthcheck PASSED: ${response.message}${keyNote}`);
   process.exit(0);
 });

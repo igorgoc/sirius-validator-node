@@ -16,11 +16,12 @@ services:
       - SIRIUS_VM_BIND_HOST=0.0.0.0
       - SIRIUS_VM_AUTH_TOKEN=${SIRIUS_VM_AUTH_TOKEN:-}
       - SIRIUS_NETWORK=${SIRIUS_NETWORK:-testnet2}
+      - SIRIUS_VALIDATOR_PRIVATE_KEY=${SIRIUS_VALIDATOR_PRIVATE_KEY:-}
+      - SIRIUS_VALIDATOR_CLUSTER_PUBKEY=${SIRIUS_VALIDATOR_CLUSTER_PUBKEY:-}
     ports:
       - "${NODE_PORT:-5051}:5051"
     volumes:
-      - ./data/drives:/app/data/drives
-      - ./data/logs:/app/data/logs
+      - ./data:/app/data
       - ./contracts:/app/contracts
     healthcheck:
       test: ["CMD", "node", "scripts/healthcheck.js"]

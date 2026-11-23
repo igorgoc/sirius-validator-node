@@ -24,6 +24,7 @@ import "internet_vm.proto";
 service SupercontractServer {
   rpc Ping (PingRequest) returns (PingReply) {}
   rpc ExecuteCall (stream Request) returns (stream Response) {}
+  rpc CosignTransaction (CosignRequest) returns (CosignReply) {}
 }
 message PingRequest {
   string name = 1;
@@ -31,6 +32,27 @@ message PingRequest {
 
 message PingReply {
   string message = 1;
+  string validator_public_key = 2;
+  string node_name = 3;
+}
+
+message CosignRequest {
+  string action = 1;
+  string aggregate_payload_hex = 2;
+  string generation_hash = 3;
+  string caller_public_key = 4;
+  string trading_account_public_key = 5;
+  string validator_cluster_public_key = 6;
+  string metadata_json = 7;
+}
+
+message CosignReply {
+  bool approved = 1;
+  string error = 2;
+  string node_name = 3;
+  string signer_public_key = 4;
+  string parent_hash = 5;
+  string signature = 6;
 }
 
 message ExecuteRequest {
