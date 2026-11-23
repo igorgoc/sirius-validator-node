@@ -58,7 +58,19 @@ function getOrInitNodeValidatorAccount(nodeName) {
     }
   }
 
-  const acc = sdk.Account.generateNewAccount(networkType);
+  const isMainnet = networkType === 184 || String(process.env.SIRIUS_NETWORK || '').toLowerCase() === 'mainnet';
+  const clusterSeed = (process.env.SIRIUS_CLUSTER_SEED || '').trim() || (!isMainnet ? DRIVE_KEY_HEX : '');
+  let acc;
+  if (clusterSeed && !process.env.SIRIUS_DISABLE_DETERMINISTIC_KEYS) {
+    const derivedPriv = crypto
+      .createHash('sha256')
+      .update(`${clusterSeed}:sirius-clob:${networkType}:validator:${nodeName}`)
+      .digest('hex')
+      .toUpperCase();
+    acc = sdk.Account.createFromPrivateKey(derivedPriv, networkType, 1);
+  } else {
+    acc = sdk.Account.generateNewAccount(networkType);
+  }
   try {
     fs.mkdirSync(path.dirname(keyFile), { recursive: true, mode: 0o700 });
     fs.writeFileSync(
