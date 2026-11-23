@@ -188,23 +188,45 @@ function verifyAndCosignOnNode(nodeName, req) {
       }
     }
 
-    if (maxFreeAtomic !== null && metadata.mosaicHex) {
-      const mKey = String(metadata.mosaicHex).toUpperCase();
-      const outAmt = totalOutgoingByMosaic.get(mKey) || 0n;
-      if (outAmt > maxFreeAtomic) {
-        throw new Error(`Security rejection on ${nodeName}: requested withdrawal ${outAmt} exceeds verified free balance ${maxFreeAtomic}`);
+    const checks = Array.isArray(metadata.mosaics) && metadata.mosaics.length > 0
+      ? metadata.mosaics
+      : (metadata.mosaicHex
+        ? [{
+            mosaicHex: metadata.mosaicHex,
+            maxWithdrawableAtomic: metadata.maxWithdrawableAtomic,
+            onChainBalanceAtomic: metadata.onChainBalanceAtomic,
+            mosaicIdDecimal: metadata.mosaicIdDecimal,
+            requestedAmountAtomic: metadata.requestedAmountAtomic,
+          }]
+        : []);
+
+    const approvedHexSet = new Set(checks.map((c) => String(c.mosaicHex || '').toUpperCase()).filter(Boolean));
+    if (approvedHexSet.size > 0) {
+      for (const [mKey] of totalOutgoingByMosaic.entries()) {
+        if (!approvedHexSet.has(mKey)) {
+          throw new Error(`Security rejection on ${nodeName}: unapproved mosaic ${mKey} in withdrawal`);
+        }
       }
     }
 
     const driveAcc = readNodeDriveBalances(callerPub);
-    if (driveAcc && metadata.onChainBalanceAtomic && metadata.mosaicIdDecimal) {
-      const mDec = String(metadata.mosaicIdDecimal);
-      const lockedInDrive = BigInt((driveAcc.locked && driveAcc.locked[mDec]) || '0');
-      const onChainAmt = BigInt(metadata.onChainBalanceAtomic);
-      const driveFree = onChainAmt > lockedInDrive ? onChainAmt - lockedInDrive : 0n;
-      const requested = metadata.requestedAmountAtomic ? BigInt(metadata.requestedAmountAtomic) : 0n;
-      if (requested > driveFree) {
-        throw new Error(`BFT lock check rejected on ${nodeName}: ${requested} > free ${driveFree} (locked=${lockedInDrive})`);
+    for (const c of checks) {
+      const mKey = String(c.mosaicHex || '').toUpperCase();
+      if (!mKey) continue;
+      const outAmt = totalOutgoingByMosaic.get(mKey) || 0n;
+      const checkMax = c.maxWithdrawableAtomic != null ? BigInt(c.maxWithdrawableAtomic) : null;
+      if (checkMax !== null && outAmt > checkMax) {
+        throw new Error(`Security rejection on ${nodeName}: requested withdrawal ${outAmt} (${mKey}) exceeds verified free balance ${checkMax}`);
+      }
+      if (driveAcc && c.onChainBalanceAtomic && c.mosaicIdDecimal) {
+        const mDec = String(c.mosaicIdDecimal);
+        const lockedInDrive = BigInt((driveAcc.locked && driveAcc.locked[mDec]) || '0');
+        const onChainAmt = BigInt(c.onChainBalanceAtomic);
+        const driveFree = onChainAmt > lockedInDrive ? onChainAmt - lockedInDrive : 0n;
+        const requested = c.requestedAmountAtomic ? BigInt(c.requestedAmountAtomic) : outAmt;
+        if (requested > driveFree) {
+          throw new Error(`BFT lock check rejected on ${nodeName}: ${requested} > free ${driveFree} (locked=${lockedInDrive})`);
+        }
       }
     }
   } else if (action === 'SETTLEMENT') {
