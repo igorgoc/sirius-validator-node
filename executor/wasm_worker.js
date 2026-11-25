@@ -412,8 +412,9 @@ const importObject = {
         return 0;
       }
       const nameBytes = Buffer.from(ret.name || '', 'utf8');
-      const memView = new DataView(memory.buffer);
       const base = Number(ptrToWrite);
+      assertWasmBounds(base, 6 + nameBytes.length);
+      const memView = new DataView(memory.buffer);
       memView.setUint32(base, Number(ret.depth || 0), true);
       memView.setUint16(base + 4, nameBytes.length, true);
       writeBytesToWasm(base + 6, nameBytes);
