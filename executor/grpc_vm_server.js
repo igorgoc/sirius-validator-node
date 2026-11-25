@@ -10,6 +10,7 @@ const crypto = require('crypto');
 const { Worker } = require('worker_threads');
 const grpc = require('@grpc/grpc-js');
 const protoLoader = require('@grpc/proto-loader');
+const { createGrpcServerCredentials } = require('./grpc_tls');
 
 const ROOT_DIR = path.resolve(__dirname, '..');
 const DATA_DIR = process.env.DATA_DIR || path.join(ROOT_DIR, 'data');
@@ -810,13 +811,22 @@ function startVmServer(port, nodeName, bindHost = process.env.SIRIUS_VM_BIND_HOS
       supercontractserver.SupercontractServer.service,
       createSupercontractService(nodeName, bindAddress)
     );
-    server.bindAsync(bindAddress, grpc.ServerCredentials.createInsecure(), (err, boundPort) => {
+    let serverCreds;
+    let tlsMode = 'insecure';
+    try {
+      const built = createGrpcServerCredentials(bindAddress);
+      serverCreds = built.credentials;
+      tlsMode = built.mode;
+    } catch (credErr) {
+      return reject(credErr);
+    }
+    server.bindAsync(bindAddress, serverCreds, (err, boundPort) => {
       if (err) {
         return reject(err);
       }
       console.log(`================================================================================`);
       console.log(`🚀 Sirius SuperContract Validator Node [${nodeName}] Online`);
-      console.log(`   Listening on:   ${bindHost}:${boundPort}`);
+      console.log(`   Listening on:   ${bindHost}:${boundPort} (${tlsMode})`);
       console.log(`   Contracts Dir:  ${CONTRACTS_DIR}`);
       console.log(`   Data/Drive Dir: ${DRIVES_DIR}`);
       console.log(`================================================================================`);
