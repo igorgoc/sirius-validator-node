@@ -204,20 +204,32 @@ function getMosaicSpecForAsset(networkType) {
 }
 
 function parseDecimalToBigIntValidator(valStr, decimals) {
-  const clean = String(valStr || '0').trim();
+  const clean = String(valStr ?? '').trim();
+  if (!clean || clean.length > 40 || !/^\d+(\.\d+)?$/.test(clean)) {
+    throw new Error(`Security rejection: invalid decimal value '${clean.slice(0, 32)}'`);
+  }
   const [intPart, fracPart = ''] = clean.split('.');
   const paddedFrac = (fracPart + '0'.repeat(decimals)).slice(0, decimals);
-  return BigInt((intPart.replace(/[^0-9]/g, '') || '0') + paddedFrac);
+  return BigInt(intPart + paddedFrac);
 }
 
 function verifySettlementAgainstOrderContext(nodeName, tx, callerPub, tradingPub, metadata, networkType) {
+  if (!tradingPub || !/^[0-9A-F]{64}$/.test(tradingPub)) {
+    throw new Error(`Security rejection on ${nodeName}: missing or invalid trading_account_public_key for SETTLEMENT`);
+  }
   const ctx = metadata && metadata.orderContext;
-  if (!ctx || !ctx.signature) return;
+  if (!ctx || !ctx.signature) {
+    throw new Error(`Security rejection on ${nodeName}: missing signed orderContext for SETTLEMENT`);
+  }
+  const sigHex = String(ctx.signature || '').trim();
+  if (!/^[0-9a-fA-F]{128}$/.test(sigHex)) {
+    throw new Error(`Security rejection on ${nodeName}: malformed orderContext signature`);
+  }
 
   const sdk = getXpxSdk();
   const { KeyPair, DerivationScheme, Address } = sdk;
   const signerPub = String(ctx.publicKey || callerPub || '').toUpperCase();
-  if (!signerPub || signerPub.length !== 64) {
+  if (!signerPub || !/^[0-9A-F]{64}$/.test(signerPub)) {
     throw new Error(`Security rejection on ${nodeName}: invalid orderContext publicKey`);
   }
   const domainSep = String(ctx.domainSeparator || `${networkType}:SiriusCLOB-v1`);
@@ -229,18 +241,18 @@ function verifySettlementAgainstOrderContext(nodeName, tx, callerPub, tradingPub
   const sigValid = KeyPair.verify(
     Buffer.from(signerPub, 'hex'),
     Buffer.from(msg, 'utf8'),
-    Buffer.from(String(ctx.signature), 'hex'),
+    Buffer.from(sigHex, 'hex'),
     DerivationScheme.Ed25519Sha3
   );
   if (!sigValid) {
     throw new Error(`Security rejection on ${nodeName}: forged or invalid user order signature in settlement`);
   }
 
-  if (!tradingPub) return;
   const tradingAddr = Address.createFromPublicKey(tradingPub, Number(networkType)).plain().replace(/[- ]/g, '').toUpperCase();
   const specs = getMosaicSpecForAsset(networkType);
   const xpxHex = specs.XPX;
-  const quoteHex = normPair.endsWith('/BNB') ? specs.BNB : specs.USDT;
+  const quoteSym = normPair.endsWith('/BNB') ? 'BNB' : 'USDT';
+  const quoteHex = quoteSym === 'BNB' ? specs.BNB : specs.USDT;
 
   const outByHex = new Map();
   const inByHex = new Map();
@@ -376,6 +388,9 @@ async function verifyAndCosignOnNode(nodeName, req) {
       throw new Error('Missing caller_public_key or trading_account_public_key for WITHDRAWAL');
     }
     const expectedRecipientRaw = String(metadata.recipientAddress || '').replace(/[- ]/g, '').toUpperCase();
+    if (!expectedRecipientRaw) {
+      throw new Error(`Security rejection on ${nodeName}: missing recipientAddress in WITHDRAWAL metadata`);
+    }
     const maxFreeAtomic = metadata.maxWithdrawableAtomic ? BigInt(metadata.maxWithdrawableAtomic) : null;
     const feeCollectorAddr = String(metadata.feeCollectorAddress || '').replace(/[- ]/g, '').toUpperCase();
     let totalOutgoingByMosaic = new Map();
@@ -389,12 +404,15 @@ async function verifyAndCosignOnNode(nodeName, req) {
       }
       const recipObj = inner.recipient || inner.recipientAddress;
       const recipAddr = recipObj && typeof recipObj.plain === 'function' ? recipObj.plain().replace(/[- ]/g, '').toUpperCase() : '';
-      if (expectedRecipientRaw && recipAddr !== expectedRecipientRaw && (!feeCollectorAddr || recipAddr !== feeCollectorAddr)) {
+      if (!recipAddr || (recipAddr !== expectedRecipientRaw && (!feeCollectorAddr || recipAddr !== feeCollectorAddr))) {
         throw new Error(`Security rejection: Transfer recipient ${recipAddr} does not match approved recipient ${expectedRecipientRaw}`);
       }
       for (const m of (inner.mosaics || [])) {
         const mHex = m.id.toHex().toUpperCase();
         const amt = BigInt(m.amount.compact ? m.amount.compact() : m.amount);
+        if (amt <= 0n) {
+          throw new Error(`Security rejection on ${nodeName}: withdrawal mosaic amount must be > 0`);
+        }
         totalOutgoingByMosaic.set(mHex, (totalOutgoingByMosaic.get(mHex) || 0n) + amt);
       }
     }
@@ -412,11 +430,12 @@ async function verifyAndCosignOnNode(nodeName, req) {
         : []);
 
     const approvedHexSet = new Set(checks.map((c) => String(c.mosaicHex || '').toUpperCase()).filter(Boolean));
-    if (approvedHexSet.size > 0) {
-      for (const [mKey] of totalOutgoingByMosaic.entries()) {
-        if (!approvedHexSet.has(mKey)) {
-          throw new Error(`Security rejection on ${nodeName}: unapproved mosaic ${mKey} in withdrawal`);
-        }
+    if (approvedHexSet.size === 0) {
+      throw new Error(`Security rejection on ${nodeName}: missing approved mosaic list in WITHDRAWAL metadata`);
+    }
+    for (const [mKey] of totalOutgoingByMosaic.entries()) {
+      if (!approvedHexSet.has(mKey)) {
+        throw new Error(`Security rejection on ${nodeName}: unapproved mosaic ${mKey} in withdrawal`);
       }
     }
 
@@ -454,14 +473,17 @@ async function verifyAndCosignOnNode(nodeName, req) {
     }
   } else if (action === 'SETTLEMENT') {
     const allowedSigners = new Set(
-      (Array.isArray(metadata.allowedSigners) ? metadata.allowedSigners : []).map((s) => String(s).toUpperCase())
+      (Array.isArray(metadata.allowedSigners) ? metadata.allowedSigners : []).map((s) => String(s).toUpperCase()).filter(Boolean)
     );
+    if (allowedSigners.size === 0) {
+      throw new Error(`Security rejection on ${nodeName}: missing allowedSigners in SETTLEMENT metadata`);
+    }
     for (const inner of tx.innerTransactions) {
       if (inner.type !== TransactionType.TRANSFER) {
         throw new Error(`Security rejection: SETTLEMENT aggregate may only contain TRANSFER transactions (got ${inner.type})`);
       }
       const signerPk = inner.signer ? inner.signer.publicKey.toUpperCase() : '';
-      if (allowedSigners.size > 0 && !allowedSigners.has(signerPk)) {
+      if (!allowedSigners.has(signerPk)) {
         throw new Error(`Security rejection: Unexpected settlement inner signer ${signerPk}`);
       }
     }
