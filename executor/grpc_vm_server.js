@@ -296,6 +296,9 @@ function verifySettlementAgainstOrderContext(nodeName, tx, callerPub, tradingPub
     if (outXpx > maxXpxWithFee) {
       throw new Error(`Security rejection on ${nodeName}: SELL XPX outflow ${outXpx} exceeds signed amount ${maxXpxWithFee}`);
     }
+    if (outXpx > 0n && inQuote === 0n) {
+      throw new Error(`Security rejection on ${nodeName}: SELL settlement sends XPX without delivering ${quoteSym}`);
+    }
     if (outXpx > 0n && limitPriceTicks > 0n) {
       const expectedQuoteRaw = (outXpx * limitPriceTicks) / PRICE_SCALE;
       if (expectedQuoteRaw >= 100n && inQuote < (expectedQuoteRaw * 97n) / 100n) {
@@ -440,7 +443,8 @@ async function verifyAndCosignOnNode(nodeName, req) {
             `L1/Drive balance check rejected on ${nodeName}: requested ${outAmt} (${mKey}) > free ${validatorFree} (L1=${l1OnChain}, locked=${lockedInDrive})`
           );
         }
-      } else if (checkItem) {
+      }
+      if (checkItem) {
         const checkMax = checkItem.maxWithdrawableAtomic != null ? BigInt(checkItem.maxWithdrawableAtomic) : null;
         if (checkMax !== null && outAmt > checkMax) {
           throw new Error(`Security rejection on ${nodeName}: requested withdrawal ${outAmt} (${mKey}) exceeds verified free balance ${checkMax}`);
