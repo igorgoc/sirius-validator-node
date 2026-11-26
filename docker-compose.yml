@@ -10,19 +10,17 @@ services:
     restart: unless-stopped
     env_file:
       - ./config/node.env
-    environment:
-      - VM_PORT=${NODE_PORT:-5051}
-      - NODE_NAME=${NODE_NAME:-node1}
-      - SIRIUS_VM_BIND_HOST=0.0.0.0
-      - SIRIUS_VM_AUTH_TOKEN=${SIRIUS_VM_AUTH_TOKEN:-}
-      - SIRIUS_NETWORK=${SIRIUS_NETWORK:-testnet2}
-      - SIRIUS_VALIDATOR_PRIVATE_KEY=${SIRIUS_VALIDATOR_PRIVATE_KEY:-}
-      - SIRIUS_VALIDATOR_CLUSTER_PUBKEY=${SIRIUS_VALIDATOR_CLUSTER_PUBKEY:-}
+    # Note: Do NOT override secrets (SIRIUS_VM_AUTH_TOKEN, SIRIUS_VALIDATOR_PRIVATE_KEY)
+    # with empty defaults here — let ./config/node.env supply them directly.
     ports:
       - "${NODE_PORT:-5051}:5051"
     volumes:
       - ./data:/app/data
-      - ./contracts:/app/contracts
+      - ./contracts:/app/contracts:ro
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
     healthcheck:
       test: ["CMD", "node", "scripts/healthcheck.js"]
       interval: 15s

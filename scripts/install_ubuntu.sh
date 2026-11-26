@@ -50,6 +50,7 @@ fi
 
 cd "${INSTALL_DIR}"
 mkdir -p data/drives data/logs config contracts
+chmod 700 data data/drives data/logs config
 
 # Setup node.env if not present
 if [ ! -f "config/node.env" ]; then
@@ -73,9 +74,21 @@ EOF
   echo "🔑 Generated random node authentication token in config/node.env."
 fi
 
-# Configure firewall
-echo "🛡️  5. Configuring UFW firewall (allowing gRPC port 5051)..."
-ufw allow 5051/tcp comment "Sirius SuperContract Validator gRPC" 2>/dev/null || true
+# Verify auth token is non-empty before starting container
+if ! grep -Eq '^SIRIUS_VM_AUTH_TOKEN=.{16,}$' config/node.env; then
+  echo "❌ ERROR: SIRIUS_VM_AUTH_TOKEN in config/node.env is missing or shorter than 16 characters." >&2
+  exit 1
+fi
+
+# Configure firewall (prefer restricting to GATEWAY_IP if provided)
+echo "🛡️  5. Configuring UFW firewall (gRPC port 5051)..."
+if [ -n "${GATEWAY_IP:-}" ]; then
+  ufw allow from "${GATEWAY_IP}" to any port 5051 proto tcp comment "Sirius Validator gRPC (Gateway only)" 2>/dev/null || true
+  echo "✅ UFW restricted port 5051/tcp strictly to GATEWAY_IP=${GATEWAY_IP}."
+else
+  ufw allow 5051/tcp comment "Sirius SuperContract Validator gRPC" 2>/dev/null || true
+  echo "⚠️  WARNING: Port 5051/tcp opened globally because GATEWAY_IP was not set. For Mainnet, restrict UFW to your CLOB Gateway IP!"
+fi
 
 # Start container
 echo "🚀 6. Starting Sirius Validator container with Docker Compose..."

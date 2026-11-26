@@ -7,6 +7,7 @@ const fs = require('fs');
 const path = require('path');
 const grpc = require('@grpc/grpc-js');
 const protoLoader = require('@grpc/proto-loader');
+const { createGrpcClientCredentials } = require('../executor/grpc_tls');
 
 const PROTO_PATH = path.join(__dirname, '../executor/proto/supercontract_server.proto');
 const PORT = parseInt(process.argv[2] || process.env.VM_PORT || '5051', 10);
@@ -21,9 +22,12 @@ const packageDefinition = protoLoader.loadSync(PROTO_PATH, {
 });
 
 const proto = grpc.loadPackageDefinition(packageDefinition);
+const targetAddr = `${HOST}:${PORT}`;
+const { credentials, channelOptions } = createGrpcClientCredentials(targetAddr);
 const client = new proto.supercontractserver.SupercontractServer(
-  `${HOST}:${PORT}`,
-  grpc.credentials.createInsecure()
+  targetAddr,
+  credentials,
+  channelOptions
 );
 
 const metadata = new grpc.Metadata();
