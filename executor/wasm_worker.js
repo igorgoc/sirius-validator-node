@@ -8,14 +8,15 @@ const { parentPort, workerData } = require('worker_threads');
 const fs = require('fs');
 
 const {
-  wasmModule,
-  fileToCall,
-  functionToCall,
-  parametersHex,
-  poexSecretDataPrefix,
-  executionGasLimit,
-  downloadGasLimit,
-  callMode,
+  poolMode = false,
+  wasmModule: initialWasmModule,
+  fileToCall: initialFileToCall,
+  functionToCall: initialFunctionToCall,
+  parametersHex: initialParametersHex,
+  poexSecretDataPrefix: initialPoexSecretDataPrefix,
+  executionGasLimit: initialExecutionGasLimit,
+  downloadGasLimit: initialDownloadGasLimit,
+  callMode: initialCallMode,
   sharedBuffer,
 } = workerData;
 
@@ -25,14 +26,16 @@ const {
 const control = new Int32Array(sharedBuffer, 0, 2);
 const dataBuffer = new Uint8Array(sharedBuffer, 8);
 
-const callParamsBuffer = Buffer.from(parametersHex || '', 'hex');
+let callParamsBuffer = Buffer.from(initialParametersHex || '', 'hex');
+let activeJobId = 0;
 
 let executionGasConsumed = 1n; // Base invocation cost = 1 gas (matches Milestone 1 spec)
 let downloadGasConsumed = 0n;
 let capturedAggregatedTransaction = null;
 
-const execGasLimitBig = BigInt(executionGasLimit || '0');
-const dlGasLimitBig = BigInt(downloadGasLimit || '0');
+let execGasLimitBig = BigInt(initialExecutionGasLimit || '0');
+let dlGasLimitBig = BigInt(initialDownloadGasLimit || '0');
+const compiledModuleCache = new Map();
 
 function consumeExecutionGas(amount) {
   const delta = BigInt(amount);
@@ -64,7 +67,7 @@ const HOST_CALL_TIMEOUT_MS = 15000;
  */
 function rpcHostCall(serverMessage) {
   Atomics.store(control, 0, 1);
-  parentPort.postMessage({ type: 'host_call', serverMessage });
+  parentPort.postMessage({ type: 'host_call', jobId: activeJobId, serverMessage });
 
   // Block WASM thread until main thread receives gRPC reply from Executor (15s safety timeout)
   const waitResult = Atomics.wait(control, 0, 1, HOST_CALL_TIMEOUT_MS);
@@ -468,19 +471,44 @@ const importObject = {
   },
 };
 
-async function executeWasm() {
+async function executeWasm(job) {
+  const {
+    jobId = 0,
+    wasmModule,
+    fileToCall,
+    functionToCall,
+    parametersHex,
+    poexSecretDataPrefix,
+    executionGasLimit,
+    downloadGasLimit,
+  } = job;
+
+  // Reset all per-invocation mutable state so pooled worker executions remain 100% isolated & deterministic
+  activeJobId = jobId;
+  callParamsBuffer = Buffer.from(parametersHex || '', 'hex');
+  executionGasConsumed = 1n;
+  downloadGasConsumed = 0n;
+  capturedAggregatedTransaction = null;
+  execGasLimitBig = BigInt(executionGasLimit || '0');
+  dlGasLimitBig = BigInt(downloadGasLimit || '0');
+  memory = null;
+  Atomics.store(control, 1, 0);
+  Atomics.store(control, 0, 0);
+
   try {
-    let instance;
-    if (wasmModule) {
-      instance = await WebAssembly.instantiate(wasmModule, importObject);
-    } else {
-      if (!fs.existsSync(fileToCall)) {
+    let mod = wasmModule || (fileToCall ? compiledModuleCache.get(fileToCall) : null);
+    if (!mod) {
+      if (!fileToCall || !fs.existsSync(fileToCall)) {
         throw new Error(`WASM file not found: ${fileToCall}`);
       }
       const wasmBytes = fs.readFileSync(fileToCall);
-      const res = await WebAssembly.instantiate(wasmBytes, importObject);
-      instance = res.instance;
+      mod = await WebAssembly.compile(wasmBytes);
+      compiledModuleCache.set(fileToCall, mod);
+    } else if (fileToCall && !compiledModuleCache.has(fileToCall)) {
+      compiledModuleCache.set(fileToCall, mod);
     }
+
+    const instance = await WebAssembly.instantiate(mod, importObject);
     memory = instance.exports.memory;
 
     const fnName = functionToCall || 'run';
@@ -496,8 +524,10 @@ async function executeWasm() {
     const prefixBig = BigInt(poexSecretDataPrefix || 0);
     const poexSecretData = (prefixBig ^ (executionGasConsumed * 0x9e3779b97f4a7c15n) ^ BigInt(returnVal)) & 0xffffffffffffffffn;
 
+    memory = null;
     parentPort.postMessage({
       type: 'execution_complete',
+      jobId,
       returns: {
         success: true,
         execution_gas_consumed: executionGasConsumed.toString(),
@@ -508,8 +538,10 @@ async function executeWasm() {
       },
     });
   } catch (err) {
+    memory = null;
     parentPort.postMessage({
       type: 'execution_complete',
+      jobId,
       returns: {
         success: false,
         execution_gas_consumed: executionGasConsumed.toString(),
@@ -522,4 +554,21 @@ async function executeWasm() {
   }
 }
 
-executeWasm();
+if (poolMode) {
+  parentPort.on('message', (msg) => {
+    if (msg && msg.type === 'execute') {
+      executeWasm(msg);
+    }
+  });
+} else {
+  executeWasm({
+    jobId: 0,
+    wasmModule: initialWasmModule,
+    fileToCall: initialFileToCall,
+    functionToCall: initialFunctionToCall,
+    parametersHex: initialParametersHex,
+    poexSecretDataPrefix: initialPoexSecretDataPrefix,
+    executionGasLimit: initialExecutionGasLimit,
+    downloadGasLimit: initialDownloadGasLimit,
+  });
+}
