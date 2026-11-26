@@ -233,7 +233,10 @@ function verifySettlementAgainstOrderContext(nodeName, tx, callerPub, tradingPub
     throw new Error(`Security rejection on ${nodeName}: invalid orderContext publicKey`);
   }
   const domainSep = String(ctx.domainSeparator || `${networkType}:SiriusCLOB-v1`);
-  const normPair = String(ctx.pair || 'XPX/USDT').toUpperCase().replace('_', '/');
+  const normPair = String(ctx.pair || 'XPX/USDT').trim().toUpperCase().replace('_', '/');
+  if (!/^XPX\/(USDT|BNB)$/.test(normPair)) {
+    throw new Error(`Security rejection on ${nodeName}: unsupported orderContext pair '${normPair}'`);
+  }
   const normSide = String(ctx.side || '').toLowerCase() === 'sell' ? 'sell' : 'buy';
   const normType = String(ctx.type || '') === 'Market' ? 'Market' : 'Limit';
   const msg = `${domainSep}:ORDER:${normPair}:${normSide}:${normType}:${String(ctx.price)}:${String(ctx.amount)}:${ctx.nonce}:${ctx.expiry}`;
@@ -263,12 +266,18 @@ function verifySettlementAgainstOrderContext(nodeName, tx, callerPub, tradingPub
     for (const m of (inner.mosaics || [])) {
       const mHex = m.id.toHex().toUpperCase();
       const amt = BigInt(m.amount.compact ? m.amount.compact() : m.amount);
+      if (amt <= 0n) {
+        throw new Error(`Security rejection on ${nodeName}: settlement transfer mosaic amount must be > 0`);
+      }
       if (sPub === tradingPub) outByHex.set(mHex, (outByHex.get(mHex) || 0n) + amt);
       if (rAddr === tradingAddr) inByHex.set(mHex, (inByHex.get(mHex) || 0n) + amt);
     }
   }
 
   const orderAmtAtomic = parseDecimalToBigIntValidator(ctx.amount, 6);
+  if (orderAmtAtomic <= 0n) {
+    throw new Error(`Security rejection on ${nodeName}: orderContext amount must be > 0`);
+  }
   const limitPriceTicks = parseDecimalToBigIntValidator(ctx.price, 8);
   const PRICE_SCALE = 100_000_000n;
 
