@@ -95,10 +95,19 @@ function createGrpcServerCredentials(bindAddress) {
     return { credentials: creds, mode: checkClientCert ? 'mTLS' : 'TLS' };
   }
 
-  if (!isLoopbackTarget(bindAddress) && process.env.SIRIUS_VM_REQUIRE_TLS === 'true') {
+  const isMainnet =
+    String(process.env.SIRIUS_NETWORK || '').toLowerCase() === 'mainnet' ||
+    String(process.env.NETWORK_ENV || '').toLowerCase() === 'mainnet' ||
+    String(process.env.SIRIUS_NETWORK_TYPE || '') === '184';
+  const requireTlsOnNonLoopback =
+    process.env.SIRIUS_VM_REQUIRE_TLS === 'true' ||
+    (isMainnet && process.env.SIRIUS_VM_ALLOW_INSECURE_REMOTE !== 'true');
+
+  if (!isLoopbackTarget(bindAddress) && requireTlsOnNonLoopback) {
     throw new Error(
-      `Security rejection: Refusing to bind non-loopback validator ${bindAddress} without TLS (SIRIUS_VM_REQUIRE_TLS=true). ` +
-      `Provide SIRIUS_VM_TLS_CERT, SIRIUS_VM_TLS_KEY, and SIRIUS_VM_TLS_CA.`
+      `Security rejection: Refusing to bind non-loopback validator ${bindAddress} without TLS` +
+      `${isMainnet ? ' on Mainnet' : ' (SIRIUS_VM_REQUIRE_TLS=true)'}. ` +
+      `Provide SIRIUS_VM_TLS_CERT, SIRIUS_VM_TLS_KEY, and SIRIUS_VM_TLS_CA (or set SIRIUS_VM_ALLOW_INSECURE_REMOTE=true ONLY inside a private WireGuard/Tailscale mesh).`
     );
   }
 
