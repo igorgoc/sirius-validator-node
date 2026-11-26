@@ -81,6 +81,9 @@ function rpcHostCall(serverMessage) {
   if (status === -1) {
     throw new Error(`Host RPC error: ${rawJson || 'stream closed'}`);
   }
+  if (status !== 2) {
+    throw new Error(`Host RPC unexpected control status: ${status}`);
+  }
   return JSON.parse(rawJson);
 }
 
@@ -270,6 +273,7 @@ const importObject = {
     },
 
     write_file_stream: (identifier, bufPtr, bufLen) => {
+      assertWasmBounds(bufPtr, bufLen);
       const chunk = Buffer.from(memory.buffer, Number(bufPtr), Number(bufLen));
       consumeExecutionGas(20 + chunk.length);
       const res = rpcHostCall({

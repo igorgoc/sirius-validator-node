@@ -232,7 +232,8 @@ function verifySettlementAgainstOrderContext(nodeName, tx, callerPub, tradingPub
   if (!signerPub || !/^[0-9A-F]{64}$/.test(signerPub)) {
     throw new Error(`Security rejection on ${nodeName}: invalid orderContext publicKey`);
   }
-  const domainSep = String(ctx.domainSeparator || `${networkType}:SiriusCLOB-v1`);
+  // Security: Always derive domain separator from the validator's own networkType (blocks cross-network replay)
+  const domainSep = `${networkType}:SiriusCLOB-v1`;
   const normPair = String(ctx.pair || 'XPX/USDT').trim().toUpperCase().replace('_', '/');
   if (!/^XPX\/(USDT|BNB)$/.test(normPair)) {
     throw new Error(`Security rejection on ${nodeName}: unsupported orderContext pair '${normPair}'`);
@@ -265,7 +266,9 @@ function verifySettlementAgainstOrderContext(nodeName, tx, callerPub, tradingPub
     const rAddr = recipObj && typeof recipObj.plain === 'function' ? recipObj.plain().replace(/[- ]/g, '').toUpperCase() : '';
     for (const m of (inner.mosaics || [])) {
       const mHex = m.id.toHex().toUpperCase();
-      const amt = BigInt(m.amount.compact ? m.amount.compact() : m.amount);
+      const amt = m.amount && typeof m.amount.toHex === 'function'
+        ? BigInt('0x' + m.amount.toHex())
+        : BigInt(m.amount.compact ? m.amount.compact() : m.amount);
       if (amt <= 0n) {
         throw new Error(`Security rejection on ${nodeName}: settlement transfer mosaic amount must be > 0`);
       }
@@ -515,11 +518,15 @@ async function verifyAndCosignOnNode(nodeName, req) {
 }
 
 function verifyVmAuthMetadata(callOrStream, bindAddress = '') {
-  const expectedToken = process.env.SIRIUS_VM_AUTH_TOKEN;
+  const expectedToken = (process.env.SIRIUS_VM_AUTH_TOKEN || '').trim();
   const isLoopbackOnly = bindAddress.startsWith('127.0.0.1') || bindAddress.startsWith('localhost');
+  const isMainnet =
+    String(process.env.SIRIUS_NETWORK || '').toLowerCase() === 'mainnet' ||
+    String(process.env.NETWORK_ENV || '').toLowerCase() === 'mainnet' ||
+    String(process.env.SIRIUS_NETWORK_TYPE || '') === '184';
   if (!expectedToken) {
-    if (process.env.NODE_ENV === 'production' || (!isLoopbackOnly && bindAddress)) {
-      console.error('[SECURITY] Rejected unauthenticated call: SIRIUS_VM_AUTH_TOKEN is required when exposed to non-loopback network');
+    if (isMainnet || process.env.NODE_ENV === 'production' || (!isLoopbackOnly && bindAddress)) {
+      console.error('[SECURITY] Rejected unauthenticated call: SIRIUS_VM_AUTH_TOKEN is required on Mainnet / production / non-loopback network');
       return false;
     }
     return true; // Dev mode on loopback only
