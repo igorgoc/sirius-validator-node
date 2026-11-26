@@ -977,6 +977,8 @@ function startVmServer(port, nodeName, bindHost = process.env.SIRIUS_VM_BIND_HOS
     const server = new grpc.Server();
     const workerPool = new WarmWasmWorkerPool(nodeName);
     workerPool.prewarm(1);
+    // Pre-warm SDK module on boot so the very first CosignTransaction never pays cold require() latency
+    try { getXpxSdk(); } catch (_) {}
     server._workerPool = workerPool;
     const origForceShutdown = server.forceShutdown.bind(server);
     server.forceShutdown = () => {
