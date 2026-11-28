@@ -214,6 +214,168 @@ function parseDecimalToBigIntValidator(valStr, decimals) {
 
 // Per-node persistent cumulative order-outflow tracker to block split-settlement replay/over-drain
 const validatorOrderOutflowCaches = new Map();
+// Per-node persistent tradingPub -> ownerPub ownership registry (blocks compromised-Gateway cross-account hijacking)
+const validatorOwnerRegistryCaches = new Map();
+// Per-node cosign serialization queue (prevents concurrent TOCTOU races on outflows & ownership checks)
+const nodeCosignQueues = new Map();
+
+function withNodeCosignLock(nodeName, fn) {
+  const prev = nodeCosignQueues.get(nodeName) || Promise.resolve();
+  const next = prev.then(fn, fn);
+  nodeCosignQueues.set(nodeName, next.catch(() => {}));
+  return next;
+}
+
+function getValidatorOwnerRegistryFile(nodeName) {
+  return path.join(CLUSTER_DIR, nodeName, 'trading_account_owners.json');
+}
+
+function loadValidatorOwnerRegistry(nodeName) {
+  if (validatorOwnerRegistryCaches.has(nodeName)) {
+    return validatorOwnerRegistryCaches.get(nodeName);
+  }
+  const map = new Map();
+  const fp = getValidatorOwnerRegistryFile(nodeName);
+  try {
+    if (fs.existsSync(fp)) {
+      const raw = JSON.parse(fs.readFileSync(fp, 'utf8'));
+      if (raw && typeof raw === 'object') {
+        for (const [k, v] of Object.entries(raw)) {
+          if (typeof v === 'string' && /^[0-9A-Fa-f]{64}$/.test(k) && /^[0-9A-Fa-f]{64}$/.test(v)) {
+            map.set(k.toUpperCase(), v.toUpperCase());
+          }
+        }
+      }
+    }
+  } catch (_) {}
+  validatorOwnerRegistryCaches.set(nodeName, map);
+  return map;
+}
+
+function saveValidatorOwnerRegistry(nodeName, map) {
+  try {
+    const obj = {};
+    for (const [k, v] of map.entries()) {
+      obj[k] = v;
+    }
+    const fp = getValidatorOwnerRegistryFile(nodeName);
+    fs.mkdirSync(path.dirname(fp), { recursive: true, mode: 0o700 });
+    const tmp = `${fp}.tmp.${process.pid}.${Date.now()}`;
+    fs.writeFileSync(tmp, JSON.stringify(obj, null, 2), { mode: 0o600 });
+    fs.renameSync(tmp, fp);
+  } catch (_) {}
+}
+
+/**
+ * Cryptographically verifies on the Validator Node itself that `tradingPub` is genuinely owned
+ * by `claimedOwnerPub` (prevents a compromised Gateway from mapping a victim's tradingPub to an
+ * attacker's ownerPub on SETTLEMENT or WITHDRAWAL).
+ */
+async function verifyTradingAccountOwnershipOnNode(nodeName, tradingPub, claimedOwnerPub, networkType) {
+  const tPub = String(tradingPub || '').trim().toUpperCase();
+  const oPub = String(claimedOwnerPub || '').trim().toUpperCase();
+  if (!/^[0-9A-F]{64}$/.test(tPub) || !/^[0-9A-F]{64}$/.test(oPub)) {
+    throw new Error(`Security rejection on ${nodeName}: invalid tradingPub or ownerPub for ownership verification`);
+  }
+  if (tPub === oPub) {
+    throw new Error(`Security rejection on ${nodeName}: trading account public key cannot equal owner public key`);
+  }
+
+  const registry = loadValidatorOwnerRegistry(nodeName);
+  const existingOwner = registry.get(tPub);
+  if (existingOwner) {
+    if (existingOwner !== oPub) {
+      throw new Error(
+        `Security rejection on ${nodeName}: Trading Account ${tPub.slice(0, 12)}... is bound to a different owner (${existingOwner.slice(0, 12)}... != ${oPub.slice(0, 12)}...)`
+      );
+    }
+    return true;
+  }
+
+  // Not yet in local node cache -> independently verify directly on Sirius L1!
+  const sdk = getXpxSdk();
+  const { Address } = sdk;
+  const tradingAddr = Address.createFromPublicKey(tPub, Number(networkType)).plain().replace(/[- ]/g, '').toUpperCase();
+  const nodes = getCanonicalL1Urls(networkType);
+  let anyNodeResponded = false;
+
+  for (const baseUrl of nodes) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 5000);
+    try {
+      const msRes = await fetch(`${baseUrl}/account/${tradingAddr}/multisig`, { signal: controller.signal });
+      clearTimeout(timer);
+      if (msRes.status === 404) {
+        anyNodeResponded = true;
+        break;
+      }
+      if (!msRes.ok) continue;
+      anyNodeResponded = true;
+      const msJson = await msRes.json();
+      const ms = msJson && msJson.multisig;
+      const cosigs = Array.isArray(ms && ms.cosignatories) ? ms.cosignatories.map((c) => String(c).toUpperCase()) : [];
+
+      // Case A: Legacy 2-of-2 Trading Account -> ownerPub MUST be an on-chain L1 cosignatory!
+      if (ms && Number(ms.minApproval) >= 2) {
+        if (cosigs.includes(oPub)) {
+          registry.set(tPub, oPub);
+          saveValidatorOwnerRegistry(nodeName, registry);
+          return true;
+        }
+        throw new Error(
+          `Security rejection on ${nodeName}: claimed owner ${oPub.slice(0, 12)}... is NOT a cosignatory of 2-of-2 Trading Account ${tPub.slice(0, 12)}... on Sirius L1`
+        );
+      }
+
+      // Case B: Instant BFT Trading Account (minApproval === 1) -> verify L1 activation tx containing
+      // 0-mosaic Transfer signed by claimedOwnerPub with message "SiriusCLOB:ACTIVATE_BFT:<claimedOwnerPub>"!
+      if (ms && Number(ms.minApproval) === 1) {
+        const expectedMemoHex = Buffer.from(`SiriusCLOB:ACTIVATE_BFT:${oPub}`, 'utf8').toString('hex').toUpperCase();
+        const txCtrl = new AbortController();
+        const txTimer = setTimeout(() => txCtrl.abort(), 5000);
+        try {
+          const txRes = await fetch(`${baseUrl}/account/${tradingAddr}/transactions/confirmed?pageSize=25`, { signal: txCtrl.signal });
+          clearTimeout(txTimer);
+          if (txRes.ok) {
+            const txList = await txRes.json();
+            const items = Array.isArray(txList) ? txList : (Array.isArray(txList && txList.data) ? txList.data : []);
+            for (const item of items) {
+              const outer = item && item.transaction;
+              if (!outer || String(outer.signer || '').toUpperCase() !== oPub) continue;
+              const inners = Array.isArray(outer.transactions) ? outer.transactions : [];
+              for (const innWrap of inners) {
+                const inn = innWrap && innWrap.transaction;
+                if (!inn || String(inn.signer || '').toUpperCase() !== oPub) continue;
+                const payloadHex = String((inn.message && inn.message.payload) || '').toUpperCase();
+                if (payloadHex === expectedMemoHex) {
+                  registry.set(tPub, oPub);
+                  saveValidatorOwnerRegistry(nodeName, registry);
+                  return true;
+                }
+              }
+            }
+          }
+        } catch (_) {
+          clearTimeout(txTimer);
+        }
+        throw new Error(
+          `Security rejection on ${nodeName}: no Sirius L1 Instant BFT ownership proof found for Trading Account ${tPub.slice(0, 12)}... -> owner ${oPub.slice(0, 12)}...`
+        );
+      }
+      break;
+    } catch (err) {
+      clearTimeout(timer);
+      if (err && /Security rejection/.test(err.message)) throw err;
+    }
+  }
+
+  if (!anyNodeResponded && process.env.SIRIUS_VALIDATOR_OFFLINE_FALLBACK === 'true') {
+    return true;
+  }
+  throw new Error(
+    `Security rejection on ${nodeName}: unable to verify ownership of Trading Account ${tPub.slice(0, 12)}... for owner ${oPub.slice(0, 12)}...`
+  );
+}
 
 function getValidatorOutflowFile(nodeName) {
   return path.join(CLUSTER_DIR, nodeName, 'cosigned_order_outflows.json');
@@ -268,7 +430,7 @@ function saveValidatorOrderOutflows(nodeName, map) {
   } catch (_) {}
 }
 
-function verifySingleParticipantSettlement(nodeName, tx, expectedSignerPub, participantTradingPub, ctx, networkType, settlementId, outflowMap) {
+function verifySingleSignedOrderContext(nodeName, expectedSignerPub, ctx, networkType) {
   if (!ctx || !ctx.signature) {
     throw new Error(`Security rejection on ${nodeName}: missing signed orderContext for SETTLEMENT`);
   }
@@ -277,7 +439,7 @@ function verifySingleParticipantSettlement(nodeName, tx, expectedSignerPub, part
     throw new Error(`Security rejection on ${nodeName}: malformed orderContext signature`);
   }
   const sdk = getXpxSdk();
-  const { KeyPair, DerivationScheme, Address } = sdk;
+  const { KeyPair, DerivationScheme } = sdk;
   const signerPub = String(ctx.publicKey || expectedSignerPub || '').toUpperCase();
   if (!signerPub || !/^[0-9A-F]{64}$/.test(signerPub)) {
     throw new Error(`Security rejection on ${nodeName}: invalid orderContext publicKey`);
@@ -285,7 +447,6 @@ function verifySingleParticipantSettlement(nodeName, tx, expectedSignerPub, part
   if (expectedSignerPub && signerPub !== expectedSignerPub.toUpperCase()) {
     throw new Error(`Security rejection on ${nodeName}: orderContext publicKey ${signerPub} does not match expected owner ${expectedSignerPub}`);
   }
-  // Security: Always derive domain separator from the validator's own networkType (blocks cross-network replay)
   const domainSep = `${networkType}:SiriusCLOB-v1`;
   const normPair = String(ctx.pair || 'XPX/USDT').trim().toUpperCase().replace('_', '/');
   if (!/^XPX\/(USDT|BNB)$/.test(normPair)) {
@@ -304,7 +465,35 @@ function verifySingleParticipantSettlement(nodeName, tx, expectedSignerPub, part
   if (!sigValid) {
     throw new Error(`Security rejection on ${nodeName}: forged or invalid user order signature in settlement`);
   }
+  const orderAmtAtomic = parseDecimalToBigIntValidator(ctx.amount, 6);
+  if (orderAmtAtomic <= 0n) {
+    throw new Error(`Security rejection on ${nodeName}: orderContext amount must be > 0`);
+  }
+  const limitPriceTicks = parseDecimalToBigIntValidator(ctx.price, 8);
+  const fingerprint = `${signerPub}:${String(ctx.nonce)}:${sigHex.slice(0, 16)}`;
+  return { signerPub, normPair, normSide, normType, orderAmtAtomic, limitPriceTicks, fingerprint };
+}
 
+function verifySingleParticipantSettlement(nodeName, tx, expectedSignerPub, participantTradingPub, ctx, networkType, settlementId, outflowMap) {
+  const primary = verifySingleSignedOrderContext(nodeName, expectedSignerPub, ctx, networkType);
+  const verifiedOrders = [primary];
+
+  // Support multi-order sweeps from the same Maker (every additional order MUST pass full Ed25519 verification)
+  if (Array.isArray(ctx.additionalOrderContexts)) {
+    const seenFp = new Set([primary.fingerprint]);
+    for (const extraCtx of ctx.additionalOrderContexts.slice(0, 16)) {
+      if (!extraCtx || !extraCtx.signature) continue;
+      const v = verifySingleSignedOrderContext(nodeName, primary.signerPub, extraCtx, networkType);
+      if (v.normPair !== primary.normPair || v.normSide !== primary.normSide) continue;
+      if (seenFp.has(v.fingerprint)) continue;
+      seenFp.add(v.fingerprint);
+      verifiedOrders.push(v);
+    }
+  }
+
+  const sdk = getXpxSdk();
+  const { Address } = sdk;
+  const { normPair, normSide } = primary;
   const tradingPubUpper = String(participantTradingPub || '').toUpperCase();
   const tradingAddr = Address.createFromPublicKey(tradingPubUpper, Number(networkType)).plain().replace(/[- ]/g, '').toUpperCase();
   const specs = getMosaicSpecForAsset(networkType);
@@ -334,13 +523,7 @@ function verifySingleParticipantSettlement(nodeName, tx, expectedSignerPub, part
     }
   }
 
-  const orderAmtAtomic = parseDecimalToBigIntValidator(ctx.amount, 6);
-  if (orderAmtAtomic <= 0n) {
-    throw new Error(`Security rejection on ${nodeName}: orderContext amount must be > 0`);
-  }
-  const limitPriceTicks = parseDecimalToBigIntValidator(ctx.price, 8);
   const PRICE_SCALE = 100_000_000n;
-
   const outXpx = outByHex.get(xpxHex) || 0n;
   const outQuote = outByHex.get(quoteHex) || 0n;
   const inXpx = inByHex.get(xpxHex) || 0n;
@@ -352,26 +535,37 @@ function verifySingleParticipantSettlement(nodeName, tx, expectedSignerPub, part
     }
   }
 
-  const fingerprint = `${signerPub}:${String(ctx.nonce)}:${sigHex.slice(0, 16)}`;
-  const prevAcc = outflowMap ? outflowMap.get(fingerprint) : null;
-  const alreadyCounted = Boolean(settlementId && prevAcc && prevAcc.settlementIds.has(String(settlementId)));
-  const cumOutXpx = (prevAcc && !alreadyCounted ? prevAcc.outXpx : 0n) + outXpx;
-  const cumOutQuote = (prevAcc && !alreadyCounted ? prevAcc.outQuote : 0n) + outQuote;
-
+  const updates = [];
   if (normSide === 'buy') {
     if (outXpx > 0n) {
       throw new Error(`Security rejection on ${nodeName}: BUY settlement cannot send XPX out of Trading Account`);
     }
-    const maxQuoteBase = (orderAmtAtomic * limitPriceTicks + PRICE_SCALE - 1n) / PRICE_SCALE;
-    const maxQuoteWithFee = (maxQuoteBase * 102n) / 100n + 1000n;
-    if (outQuote > maxQuoteWithFee || cumOutQuote > maxQuoteWithFee) {
-      throw new Error(`Security rejection on ${nodeName}: BUY quote outflow ${cumOutQuote} exceeds signed limit ${maxQuoteWithFee}`);
+    let totalAvailQuoteCap = 0n;
+    let maxAllowedPriceTicks = 0n;
+    let remQuoteToAlloc = outQuote;
+    for (const vo of verifiedOrders) {
+      const maxQuoteBase = (vo.orderAmtAtomic * vo.limitPriceTicks + PRICE_SCALE - 1n) / PRICE_SCALE;
+      const maxQuoteWithFee = (maxQuoteBase * 102n) / 100n + 1000n;
+      const prevAcc = outflowMap ? outflowMap.get(vo.fingerprint) : null;
+      const alreadyCounted = Boolean(settlementId && prevAcc && prevAcc.settlementIds.has(String(settlementId)));
+      const usedQuote = (prevAcc && !alreadyCounted) ? prevAcc.outQuote : 0n;
+      const avail = maxQuoteWithFee > usedQuote ? maxQuoteWithFee - usedQuote : 0n;
+      totalAvailQuoteCap += avail;
+      if (vo.limitPriceTicks > maxAllowedPriceTicks) maxAllowedPriceTicks = vo.limitPriceTicks;
+      if (remQuoteToAlloc > 0n && avail > 0n) {
+        const take = remQuoteToAlloc < avail ? remQuoteToAlloc : avail;
+        updates.push({ fingerprint: vo.fingerprint, outXpx: 0n, outQuote: take });
+        remQuoteToAlloc -= take;
+      }
+    }
+    if (outQuote > totalAvailQuoteCap) {
+      throw new Error(`Security rejection on ${nodeName}: BUY quote outflow ${outQuote} exceeds signed limit ${totalAvailQuoteCap}`);
     }
     if (outQuote > 0n && inXpx === 0n) {
       throw new Error(`Security rejection on ${nodeName}: BUY settlement sends quote without delivering XPX`);
     }
     if (inXpx > 0n && outQuote > 0n) {
-      const maxCostForFill = ((inXpx * limitPriceTicks + PRICE_SCALE - 1n) / PRICE_SCALE) * 102n / 100n + 1000n;
+      const maxCostForFill = ((inXpx * maxAllowedPriceTicks + PRICE_SCALE - 1n) / PRICE_SCALE) * 102n / 100n + 1000n;
       if (outQuote > maxCostForFill) {
         throw new Error(`Security rejection on ${nodeName}: BUY execution cost ${outQuote} exceeds signed limit price`);
       }
@@ -380,25 +574,43 @@ function verifySingleParticipantSettlement(nodeName, tx, expectedSignerPub, part
     if (outQuote > 0n) {
       throw new Error(`Security rejection on ${nodeName}: SELL settlement cannot send quote out of Trading Account`);
     }
-    const maxXpxWithFee = (orderAmtAtomic * 102n) / 100n + 1000n;
-    if (outXpx > maxXpxWithFee || cumOutXpx > maxXpxWithFee) {
-      throw new Error(`Security rejection on ${nodeName}: SELL XPX outflow ${cumOutXpx} exceeds signed amount ${maxXpxWithFee}`);
+    let totalAvailXpxCap = 0n;
+    let minAllowedPriceTicks = null;
+    let remXpxToAlloc = outXpx;
+    for (const vo of verifiedOrders) {
+      const maxXpxWithFee = (vo.orderAmtAtomic * 102n) / 100n + 1000n;
+      const prevAcc = outflowMap ? outflowMap.get(vo.fingerprint) : null;
+      const alreadyCounted = Boolean(settlementId && prevAcc && prevAcc.settlementIds.has(String(settlementId)));
+      const usedXpx = (prevAcc && !alreadyCounted) ? prevAcc.outXpx : 0n;
+      const avail = maxXpxWithFee > usedXpx ? maxXpxWithFee - usedXpx : 0n;
+      totalAvailXpxCap += avail;
+      if (minAllowedPriceTicks === null || vo.limitPriceTicks < minAllowedPriceTicks) {
+        minAllowedPriceTicks = vo.limitPriceTicks;
+      }
+      if (remXpxToAlloc > 0n && avail > 0n) {
+        const take = remXpxToAlloc < avail ? remXpxToAlloc : avail;
+        updates.push({ fingerprint: vo.fingerprint, outXpx: take, outQuote: 0n });
+        remXpxToAlloc -= take;
+      }
+    }
+    if (outXpx > totalAvailXpxCap) {
+      throw new Error(`Security rejection on ${nodeName}: SELL XPX outflow ${outXpx} exceeds signed amount ${totalAvailXpxCap}`);
     }
     if (outXpx > 0n && inQuote === 0n) {
       throw new Error(`Security rejection on ${nodeName}: SELL settlement sends XPX without delivering ${quoteSym}`);
     }
-    if (outXpx > 0n && limitPriceTicks > 0n) {
-      const expectedQuoteRaw = (outXpx * limitPriceTicks) / PRICE_SCALE;
+    if (outXpx > 0n && minAllowedPriceTicks && minAllowedPriceTicks > 0n) {
+      const expectedQuoteRaw = (outXpx * minAllowedPriceTicks) / PRICE_SCALE;
       if (expectedQuoteRaw >= 100n && inQuote < (expectedQuoteRaw * 97n) / 100n) {
         throw new Error(`Security rejection on ${nodeName}: SELL quote received ${inQuote} below signed limit floor`);
       }
     }
   }
 
-  return { fingerprint, outXpx, outQuote };
+  return updates;
 }
 
-function verifySettlementAgainstOrderContext(nodeName, tx, callerPub, tradingPub, metadata, networkType) {
+async function verifySettlementAgainstOrderContext(nodeName, tx, callerPub, tradingPub, metadata, networkType) {
   if (!tradingPub || !/^[0-9A-F]{64}$/.test(tradingPub)) {
     throw new Error(`Security rejection on ${nodeName}: missing or invalid trading_account_public_key for SETTLEMENT`);
   }
@@ -411,10 +623,12 @@ function verifySettlementAgainstOrderContext(nodeName, tx, callerPub, tradingPub
   const outflowMap = loadValidatorOrderOutflows(nodeName);
   const verifiedUpdates = [];
 
-  // 1. Always verify primary participant (Taker / callerPub)
+  // 1. Always verify primary participant (Taker / callerPub) order signature & flows, then bind-check ownership on node/L1
   verifiedUpdates.push(
-    verifySingleParticipantSettlement(nodeName, tx, callerPub, tradingPub, rootCtx, networkType, settlementId, outflowMap)
+    ...verifySingleParticipantSettlement(nodeName, tx, callerPub, tradingPub, rootCtx, networkType, settlementId, outflowMap)
   );
+  // CRITICAL: Independently verify on the Validator Node that tradingPub belongs to callerPub
+  await verifyTradingAccountOwnershipOnNode(nodeName, tradingPub, callerPub, networkType);
 
   // 2. Multi-participant BFT Zero-Trust Verification (Option 1 Instant DEX + P2P):
   // Independently verify EVERY OTHER non-Vault Trading Account that has an outflow in this aggregate!
@@ -444,7 +658,6 @@ function verifySettlementAgainstOrderContext(nodeName, tx, callerPub, tradingPub
       ? (pContexts[ownerPub.toLowerCase()] || pContexts[ownerPub] || null)
       : null;
     if (!ownerPub || !otherCtx) {
-      // If metadata explicitly flags instantBftParticipants or participantTradingMap is provided, fail closed!
       if (
         (metadata && metadata.requireAllParticipantsVerified) ||
         Object.keys(tradingToOwner).length > 0
@@ -455,8 +668,10 @@ function verifySettlementAgainstOrderContext(nodeName, tx, callerPub, tradingPub
       }
       continue;
     }
+    // CRITICAL: Independently verify on the Validator Node that otherTradingPub belongs to ownerPub!
+    await verifyTradingAccountOwnershipOnNode(nodeName, otherTradingPub, ownerPub, networkType);
     verifiedUpdates.push(
-      verifySingleParticipantSettlement(nodeName, tx, ownerPub, otherTradingPub, otherCtx, networkType, settlementId, outflowMap)
+      ...verifySingleParticipantSettlement(nodeName, tx, ownerPub, otherTradingPub, otherCtx, networkType, settlementId, outflowMap)
     );
   }
 
@@ -464,8 +679,13 @@ function verifySettlementAgainstOrderContext(nodeName, tx, callerPub, tradingPub
 }
 
 async function verifyAndCosignOnNode(nodeName, req) {
+  return withNodeCosignLock(nodeName, () => _verifyAndCosignOnNodeUnlocked(nodeName, req));
+}
+
+async function _verifyAndCosignOnNodeUnlocked(nodeName, req) {
   const sdk = getXpxSdk();
   const {
+    Address,
     TransactionMapping,
     TransactionType,
     CosignatureTransaction,
@@ -476,7 +696,13 @@ async function verifyAndCosignOnNode(nodeName, req) {
   const generationHash = String(req.generation_hash || '').trim();
   const callerPub = String(req.caller_public_key || '').trim().toUpperCase();
   const tradingPub = String(req.trading_account_public_key || '').trim().toUpperCase();
-  const clusterPub = String(req.validator_cluster_public_key || process.env.SIRIUS_VALIDATOR_CLUSTER_PUBKEY || '').trim().toUpperCase();
+  const envClusterPub = String(process.env.SIRIUS_VALIDATOR_CLUSTER_PUBKEY || '').trim().toUpperCase();
+  const reqClusterPub = String(req.validator_cluster_public_key || '').trim().toUpperCase();
+  if (envClusterPub && reqClusterPub && envClusterPub !== reqClusterPub) {
+    throw new Error(`Security rejection on ${nodeName}: validator_cluster_public_key mismatch against node configuration`);
+  }
+  const clusterPub = envClusterPub || reqClusterPub;
+  const activeNetType = Number(process.env.SIRIUS_NETWORK_TYPE || (String(process.env.SIRIUS_NETWORK || '').toLowerCase() === 'mainnet' ? 184 : 168));
 
   if (!payloadHex || !generationHash) {
     throw new Error('Missing aggregate_payload_hex or generation_hash');
@@ -506,8 +732,16 @@ async function verifyAndCosignOnNode(nodeName, req) {
       : '');
 
   let pendingSettlementOutflowCommit = null;
+  let pendingOwnerBindingCommit = null;
 
   if (action === 'ACTIVATE_TRADING_ACCOUNT') {
+    if (!/^[0-9A-F]{64}$/.test(callerPub) || !/^[0-9A-F]{64}$/.test(tradingPub) || callerPub === tradingPub) {
+      throw new Error(`Security rejection on ${nodeName}: invalid or identical caller_public_key / trading_account_public_key`);
+    }
+    const existingOwner = loadValidatorOwnerRegistry(nodeName).get(tradingPub);
+    if (existingOwner && existingOwner !== callerPub) {
+      throw new Error(`Security rejection on ${nodeName}: Trading Account ${tradingPub.slice(0, 12)}... is already bound to a different owner`);
+    }
     if (tx.innerTransactions.length < 1 || tx.innerTransactions.length > 2) {
       throw new Error(`ACTIVATE_TRADING_ACCOUNT must contain 1 or 2 inner transactions (got ${tx.innerTransactions.length})`);
     }
@@ -544,7 +778,9 @@ async function verifyAndCosignOnNode(nodeName, req) {
       if (otherTxs.length !== 1) {
         throw new Error('Security rejection: Instant BFT activation must include 1 owner authorization anchor transfer');
       }
-      // Require 0-mosaic Transfer signed by callerPub -> tradingPub to prove Owner authorization on L1
+      const expectedTradingAddr = Address.createFromPublicKey(tradingPub, activeNetType).plain().replace(/[- ]/g, '').toUpperCase();
+      const expectedAnchorMemo = `SiriusCLOB:ACTIVATE_BFT:${callerPub}`;
+      // Require 0-mosaic Transfer signed by callerPub -> tradingPub with exact ACTIVATE_BFT memo to prove Owner authorization on L1
       for (const anchor of otherTxs) {
         if (anchor.type !== TransactionType.TRANSFER) {
           throw new Error(`Security rejection: unexpected inner tx type ${anchor.type} in Instant BFT activation`);
@@ -555,6 +791,17 @@ async function verifyAndCosignOnNode(nodeName, req) {
         if (Array.isArray(anchor.mosaics) && anchor.mosaics.length > 0) {
           throw new Error('Security rejection: Instant BFT activation anchor transfer must carry 0 mosaics');
         }
+        const aRecip = anchor.recipient || anchor.recipientAddress;
+        const aRecipAddr = aRecip && typeof aRecip.plain === 'function' ? aRecip.plain().replace(/[- ]/g, '').toUpperCase() : '';
+        if (aRecipAddr !== expectedTradingAddr) {
+          throw new Error('Security rejection: Instant BFT activation anchor recipient must be trading_account address');
+        }
+        const aMsgText = String((anchor.message && anchor.message.message) || '');
+        const aMsgPayload = String((anchor.message && anchor.message.payload) || '').toUpperCase();
+        const expectedAnchorMemoHex = Buffer.from(expectedAnchorMemo, 'utf8').toString('hex').toUpperCase();
+        if (aMsgText !== expectedAnchorMemo && aMsgPayload !== expectedAnchorMemoHex) {
+          throw new Error('Security rejection: Instant BFT activation anchor memo must strictly be SiriusCLOB:ACTIVATE_BFT:<callerPub>');
+        }
       }
     } else {
       if (otherTxs.length > 0) {
@@ -564,6 +811,7 @@ async function verifyAndCosignOnNode(nodeName, req) {
         throw new Error('Security rejection: Modifications must strictly include [UserMainPublicKey, ValidatorClusterPublicKey]');
       }
     }
+    pendingOwnerBindingCommit = { tradingPub, ownerPub: callerPub };
   } else if (action === 'WITHDRAWAL') {
     if (!tradingPub || !callerPub) {
       throw new Error('Missing caller_public_key or trading_account_public_key for WITHDRAWAL');
@@ -573,8 +821,9 @@ async function verifyAndCosignOnNode(nodeName, req) {
       throw new Error(`Security rejection on ${nodeName}: missing recipientAddress in WITHDRAWAL metadata`);
     }
     const maxFreeAtomic = metadata.maxWithdrawableAtomic ? BigInt(metadata.maxWithdrawableAtomic) : null;
-    const networkType = Number(process.env.SIRIUS_NETWORK_TYPE || (String(process.env.SIRIUS_NETWORK || '').toLowerCase() === 'mainnet' ? 184 : 168));
-    const feeCollectorAddr = String(metadata.feeCollectorAddress || '').replace(/[- ]/g, '').toUpperCase();
+    const networkType = activeNetType;
+    // Security: NEVER trust Gateway-supplied feeCollectorAddress; only accept node-configured FEE_COLLECTOR_ADDRESS
+    const feeCollectorAddr = String(process.env.FEE_COLLECTOR_ADDRESS || '').replace(/[- ]/g, '').toUpperCase();
     let totalOutgoingByMosaic = new Map();
 
     for (const inner of tx.innerTransactions) {
@@ -624,6 +873,11 @@ async function verifyAndCosignOnNode(nodeName, req) {
     if (!outerSignerPub || outerSignerPub !== callerPub) {
       throw new Error(`Security rejection on ${nodeName}: WITHDRAWAL outer initiator must strictly be caller_public_key`);
     }
+    if (totalOutgoingByMosaic.size === 0) {
+      throw new Error(`Security rejection on ${nodeName}: WITHDRAWAL must transfer at least one mosaic from trading_account_public_key`);
+    }
+    // CRITICAL: Independently verify on the Validator Node that tradingPub belongs to callerPub!
+    await verifyTradingAccountOwnershipOnNode(nodeName, tradingPub, callerPub, networkType);
     for (const [mKey] of totalOutgoingByMosaic.entries()) {
       if (!approvedHexSet.has(mKey)) {
         throw new Error(`Security rejection on ${nodeName}: unapproved mosaic ${mKey} in withdrawal`);
@@ -677,14 +931,20 @@ async function verifyAndCosignOnNode(nodeName, req) {
         throw new Error(`Security rejection: Unexpected settlement inner signer ${signerPk}`);
       }
     }
-    const settlementNetType = Number(process.env.SIRIUS_NETWORK_TYPE || (String(process.env.SIRIUS_NETWORK || '').toLowerCase() === 'mainnet' ? 184 : 168));
-    pendingSettlementOutflowCommit = verifySettlementAgainstOrderContext(nodeName, tx, callerPub, tradingPub, metadata, settlementNetType);
+    pendingSettlementOutflowCommit = await verifySettlementAgainstOrderContext(nodeName, tx, callerPub, tradingPub, metadata, activeNetType);
   } else {
     throw new Error(`Unsupported cosign action: ${action}`);
   }
 
   const validatorAcc = getOrInitNodeValidatorAccount(nodeName);
   const cosig = CosignatureTransaction.signTransactionPayload(validatorAcc, payloadHex, generationHash);
+
+  // Record verified tradingPub -> ownerPub binding ONLY AFTER all activation checks and cosigning succeeded
+  if (pendingOwnerBindingCommit) {
+    const registry = loadValidatorOwnerRegistry(nodeName);
+    registry.set(pendingOwnerBindingCommit.tradingPub, pendingOwnerBindingCommit.ownerPub);
+    saveValidatorOwnerRegistry(nodeName, registry);
+  }
 
   // Record verified cumulative order outflows ONLY AFTER all security checks and cosigning succeeded
   if (pendingSettlementOutflowCommit && pendingSettlementOutflowCommit.verifiedUpdates.length > 0) {
