@@ -334,24 +334,48 @@ async function verifyTradingAccountOwnershipOnNode(nodeName, tradingPub, claimed
         const txCtrl = new AbortController();
         const txTimer = setTimeout(() => txCtrl.abort(), 5000);
         try {
-          const txRes = await fetch(`${baseUrl}/account/${tradingAddr}/transactions/confirmed?pageSize=25`, { signal: txCtrl.signal });
+          const txRes = await fetch(`${baseUrl}/transactions/confirmed?signerPublicKey=${oPub}&pageSize=25`, { signal: txCtrl.signal });
           clearTimeout(txTimer);
           if (txRes.ok) {
             const txList = await txRes.json();
-            const items = Array.isArray(txList) ? txList : (Array.isArray(txList && txList.data) ? txList.data : []);
+            const items = Array.isArray(txList && txList.data) ? txList.data : (Array.isArray(txList) ? txList : []);
             for (const item of items) {
               const outer = item && item.transaction;
-              if (!outer || String(outer.signer || '').toUpperCase() !== oPub) continue;
-              const inners = Array.isArray(outer.transactions) ? outer.transactions : [];
-              for (const innWrap of inners) {
-                const inn = innWrap && innWrap.transaction;
-                if (!inn || String(inn.signer || '').toUpperCase() !== oPub) continue;
-                const payloadHex = String((inn.message && inn.message.payload) || '').toUpperCase();
-                if (payloadHex === expectedMemoHex) {
+              const txHash = item && item.meta && item.meta.hash;
+              if (!outer || Number(outer.type) !== 16705 || String(outer.signer || '').toUpperCase() !== oPub || !txHash) continue;
+              const fullCtrl = new AbortController();
+              const fullTimer = setTimeout(() => fullCtrl.abort(), 4000);
+              try {
+                const fullRes = await fetch(`${baseUrl}/transactions/confirmed/${txHash}`, { signal: fullCtrl.signal });
+                clearTimeout(fullTimer);
+                if (!fullRes.ok) continue;
+                const fullJson = await fullRes.json();
+                const inners = Array.isArray(fullJson && fullJson.transaction && fullJson.transaction.transactions)
+                  ? fullJson.transaction.transactions
+                  : [];
+                let matchesTradingMod = false;
+                let matchesOwnerAnchor = false;
+                for (const innWrap of inners) {
+                  const inn = innWrap && innWrap.transaction;
+                  if (!inn) continue;
+                  if (Number(inn.type) === 16725 && String(inn.signer || '').toUpperCase() === tPub) {
+                    matchesTradingMod = true;
+                  }
+                  if (
+                    Number(inn.type) === 16724 &&
+                    String(inn.signer || '').toUpperCase() === oPub &&
+                    String((inn.message && inn.message.payload) || '').toUpperCase() === expectedMemoHex
+                  ) {
+                    matchesOwnerAnchor = true;
+                  }
+                }
+                if (matchesTradingMod && matchesOwnerAnchor) {
                   registry.set(tPub, oPub);
                   saveValidatorOwnerRegistry(nodeName, registry);
                   return true;
                 }
+              } catch (_) {
+                clearTimeout(fullTimer);
               }
             }
           }
