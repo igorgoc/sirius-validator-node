@@ -16,6 +16,7 @@ services:
       - "${NODE_PORT:-5051}:5051"
     volumes:
       - ./data:/app/data
+      - ./cluster:/app/cluster
       - ./contracts:/app/contracts:ro
     security_opt:
       - no-new-privileges:true

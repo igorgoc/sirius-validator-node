@@ -11,9 +11,18 @@ const { Worker } = require('worker_threads');
 const grpc = require('@grpc/grpc-js');
 const protoLoader = require('@grpc/proto-loader');
 const { createGrpcServerCredentials } = require('./grpc_tls');
+const {
+  resolveKeystorePassphrase,
+  encryptValidatorKeyRecord,
+  writeEncryptedKeystoreFile,
+  readEncryptedKeystoreFile,
+  secureShredFile,
+} = require('./validator_keystore');
 
 const ROOT_DIR = path.resolve(__dirname, '..');
-const CLUSTER_DIR = path.join(ROOT_DIR, 'cluster');
+const CLUSTER_DIR = process.env.SIRIUS_CLUSTER_DIR
+  ? path.resolve(process.env.SIRIUS_CLUSTER_DIR)
+  : path.join(ROOT_DIR, 'cluster');
 const CONTRACTS_DIR = path.join(ROOT_DIR, 'contracts');
 const PROTO_DIR = path.join(__dirname, 'proto');
 const PROTO_PATH = path.join(PROTO_DIR, 'supercontract_server.proto');
@@ -38,21 +47,69 @@ function getOrInitNodeValidatorAccount(nodeName) {
   }
   const sdk = getXpxSdk();
   const networkType = Number(process.env.SIRIUS_NETWORK_TYPE || (String(process.env.SIRIUS_NETWORK || '').toLowerCase() === 'mainnet' ? 184 : 168));
+  const requireEncrypted = String(process.env.SIRIUS_REQUIRE_ENCRYPTED_KEYSTORE || '').toLowerCase() === 'true';
+
   const envSpecificKey = process.env[`SIRIUS_VALIDATOR_PRIVATE_KEY_${String(nodeName).toUpperCase().replace(/[^A-Z0-9]/g, '_')}`];
   const envGenericKey = process.env.SIRIUS_VALIDATOR_PRIVATE_KEY;
   const rawEnvKey = (envSpecificKey || envGenericKey || '').trim();
 
   if (rawEnvKey && /^[0-9a-fA-F]{64}$/.test(rawEnvKey)) {
+    if (requireEncrypted) {
+      throw new Error(`Security rejection on ${nodeName}: raw SIRIUS_VALIDATOR_PRIVATE_KEY is forbidden when SIRIUS_REQUIRE_ENCRYPTED_KEYSTORE=true`);
+    }
     const acc = sdk.Account.createFromPrivateKey(rawEnvKey, networkType, 1);
     nodeValidatorCache.set(nodeName, acc);
     return acc;
   }
 
+  const encKeyFile = path.join(CLUSTER_DIR, nodeName, 'validator_key.enc');
   const keyFile = path.join(CLUSTER_DIR, nodeName, 'validator_key.json');
+
+  // 1. Encrypted AES-256-GCM keystore (validator_key.enc) ALWAYS takes precedence and fails closed
+  if (fs.existsSync(encKeyFile)) {
+    const passphrase = resolveKeystorePassphrase(nodeName);
+    if (!passphrase) {
+      throw new Error(
+        `Encrypted keystore ${encKeyFile} found, but no passphrase provided. Set SIRIUS_KEYSTORE_PASSPHRASE_FILE, systemd LoadCredential=validator_passphrase, or SIRIUS_KEYSTORE_PASSPHRASE.`
+      );
+    }
+    const data = readEncryptedKeystoreFile(encKeyFile, passphrase);
+    const acc = sdk.Account.createFromPrivateKey(data.privateKey, networkType, 1);
+    nodeValidatorCache.set(nodeName, acc);
+    return acc;
+  }
+
+  // 2. Legacy plaintext validator_key.json (blocked if SIRIUS_REQUIRE_ENCRYPTED_KEYSTORE=true)
   if (fs.existsSync(keyFile)) {
+    if (requireEncrypted) {
+      throw new Error(
+        `Security rejection on ${nodeName}: plaintext ${keyFile} is forbidden when SIRIUS_REQUIRE_ENCRYPTED_KEYSTORE=true. Run: node scripts/keystore.js encrypt --node ${nodeName}`
+      );
+    }
     const data = JSON.parse(fs.readFileSync(keyFile, 'utf8'));
     if (data && data.privateKey && /^[0-9a-fA-F]{64}$/.test(data.privateKey)) {
       const acc = sdk.Account.createFromPrivateKey(data.privateKey, networkType, 1);
+      // Optional automatic migration from plaintext -> encrypted keystore
+      if (String(process.env.SIRIUS_AUTO_ENCRYPT_KEYSTORE || '').toLowerCase() === 'true') {
+        const passphrase = resolveKeystorePassphrase(nodeName);
+        if (passphrase) {
+          const envelope = encryptValidatorKeyRecord(
+            {
+              nodeName,
+              networkType,
+              address: acc.address.plain(),
+              publicKey: acc.publicKey,
+              privateKey: acc.privateKey,
+              createdAt: data.createdAt || new Date().toISOString(),
+            },
+            passphrase
+          );
+          writeEncryptedKeystoreFile(encKeyFile, envelope);
+          readEncryptedKeystoreFile(encKeyFile, passphrase); // verify round-trip before shredding
+          secureShredFile(keyFile);
+          console.log(`[${nodeName} VM] 🔐 Auto-migrated plaintext validator_key.json -> AES-256-GCM validator_key.enc`);
+        }
+      }
       nodeValidatorCache.set(nodeName, acc);
       return acc;
     }
@@ -71,25 +128,34 @@ function getOrInitNodeValidatorAccount(nodeName) {
   } else {
     acc = sdk.Account.generateNewAccount(networkType);
   }
-  try {
-    fs.mkdirSync(path.dirname(keyFile), { recursive: true, mode: 0o700 });
-    fs.writeFileSync(
-      keyFile,
-      JSON.stringify(
-        {
-          nodeName,
-          networkType,
-          address: acc.address.plain(),
-          publicKey: acc.publicKey,
-          privateKey: acc.privateKey,
-          createdAt: new Date().toISOString(),
-        },
-        null,
-        2
-      ),
-      { mode: 0o600 }
+
+  const passphrase = resolveKeystorePassphrase(nodeName);
+  if (requireEncrypted && !passphrase) {
+    throw new Error(
+      `Security rejection on ${nodeName}: SIRIUS_REQUIRE_ENCRYPTED_KEYSTORE=true requires a keystore passphrase to initialize validator_key.enc`
     );
+  }
+
+  const record = {
+    nodeName,
+    networkType,
+    address: acc.address.plain(),
+    publicKey: acc.publicKey,
+    privateKey: acc.privateKey,
+    createdAt: new Date().toISOString(),
+  };
+
+  try {
+    if (passphrase) {
+      const envelope = encryptValidatorKeyRecord(record, passphrase);
+      writeEncryptedKeystoreFile(encKeyFile, envelope);
+      console.log(`[${nodeName} VM] 🔐 Initialized encrypted AES-256-GCM keystore at ${encKeyFile}`);
+    } else {
+      fs.mkdirSync(path.dirname(keyFile), { recursive: true, mode: 0o700 });
+      fs.writeFileSync(keyFile, JSON.stringify(record, null, 2), { mode: 0o600 });
+    }
   } catch (e) {
+    if (passphrase || requireEncrypted) throw e;
     console.warn(`[${nodeName} VM] Warning persisting validator key:`, e.message);
   }
   nodeValidatorCache.set(nodeName, acc);
@@ -1475,6 +1541,16 @@ function startVmServer(port, nodeName, bindHost = process.env.SIRIUS_VM_BIND_HOS
     workerPool.prewarm(1);
     // Pre-warm SDK module on boot so the very first CosignTransaction never pays cold require() latency
     try { getXpxSdk(); } catch (_) {}
+    // Fail fast at startup if encrypted keystore is present/required and passphrase is missing or wrong
+    const encBootFile = path.join(CLUSTER_DIR, nodeName, 'validator_key.enc');
+    if (fs.existsSync(encBootFile) || String(process.env.SIRIUS_REQUIRE_ENCRYPTED_KEYSTORE || '').toLowerCase() === 'true') {
+      try {
+        getOrInitNodeValidatorAccount(nodeName);
+      } catch (keyErr) {
+        workerPool.shutdown();
+        return reject(keyErr);
+      }
+    }
     server._workerPool = workerPool;
     const origForceShutdown = server.forceShutdown.bind(server);
     server.forceShutdown = () => {

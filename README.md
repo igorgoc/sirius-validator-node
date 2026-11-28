@@ -123,14 +123,31 @@ Expected output:
 
 ## 🔒 Security Best Practices
 
-1. **Firewall (UFW)**:
+1. **Encrypted Validator Keystore (`validator_key.enc`, AES-256-GCM + `scrypt`)**:
+   Never store plaintext validator private keys on a VPS disk. Initialize or migrate your node key into an AES-256-GCM encrypted keystore:
+   ```bash
+   # Option A: Generate a brand-new key directly into cluster/node1/validator_key.enc
+   node scripts/keystore.js init --node node1
+
+   # Option B: Encrypt an existing plaintext validator_key.json and shred the plaintext
+   node scripts/keystore.js encrypt --node node1
+
+   # Inspect public key / address without entering the passphrase
+   node scripts/keystore.js inspect --node node1
+   ```
+   Then supply the passphrase via a `chmod 600` secret file (or `systemd` `LoadCredential=validator_passphrase:...`) and enforce encrypted mode in `config/node.env`:
+   ```env
+   SIRIUS_REQUIRE_ENCRYPTED_KEYSTORE=true
+   SIRIUS_KEYSTORE_PASSPHRASE_FILE=/run/secrets/validator_passphrase
+   ```
+2. **Firewall (UFW)**:
    Restrict inbound traffic on port `5051` so that only the Gateway server and peer validator IP addresses can connect:
    ```bash
    ufw allow from <GATEWAY_IP> to any port 5051 proto tcp
    ```
-2. **WireGuard / Private Mesh**:
+3. **WireGuard / Private Mesh**:
    For institutional production, deploy validator nodes inside a private WireGuard or Tailscale overlay mesh network.
-3. **Contract Hash Whitelisting**:
+4. **Contract Hash Whitelisting**:
    Set `SIRIUS_ALLOWED_WASM_SHA256` in `node.env` to the exact SHA-256 hash of the audited `sirius_clob.wasm` binary. The node will automatically reject execution of any unauthorized code.
 
 ---
