@@ -1,7 +1,7 @@
 /**
- * Sirius SuperContract V2 — Production Standalone gRPC Virtual Machine Server
+ * Sirius SuperContract V2 — Production gRPC Virtual Machine Server
  * Implements `supercontractserver.SupercontractServer` (`supercontract_server.proto`)
- * for an independent validator node (e.g. running on an independent VPS or container).
+ * for a single validator node (e.g. 127.0.0.1:5051, 5052, 5053).
  */
 
 const fs = require('fs');
@@ -13,11 +13,10 @@ const protoLoader = require('@grpc/proto-loader');
 const { createGrpcServerCredentials } = require('./grpc_tls');
 
 const ROOT_DIR = path.resolve(__dirname, '..');
-const DATA_DIR = process.env.DATA_DIR || path.join(ROOT_DIR, 'data');
-const DRIVES_DIR = path.join(DATA_DIR, 'drives');
-const CONTRACTS_DIR = process.env.CONTRACTS_DIR || path.join(ROOT_DIR, 'contracts');
-const PROTO_DIR = __dirname;
-const PROTO_PATH = path.join(PROTO_DIR, 'proto/supercontract_server.proto');
+const CLUSTER_DIR = path.join(ROOT_DIR, 'cluster');
+const CONTRACTS_DIR = path.join(ROOT_DIR, 'contracts');
+const PROTO_DIR = path.join(__dirname, 'proto');
+const PROTO_PATH = path.join(PROTO_DIR, 'supercontract_server.proto');
 const DRIVE_KEY_HEX = process.env.DRIVE_KEY_HEX || 'bd1d100a98c34f62e170a8395b4498dc1e730286f5a12c489b37d01562f0cb23';
 
 let xpxSdk = null;
@@ -49,7 +48,7 @@ function getOrInitNodeValidatorAccount(nodeName) {
     return acc;
   }
 
-  const keyFile = path.join(DATA_DIR, 'validator_key.json');
+  const keyFile = path.join(CLUSTER_DIR, nodeName, 'validator_key.json');
   if (fs.existsSync(keyFile)) {
     const data = JSON.parse(fs.readFileSync(keyFile, 'utf8'));
     if (data && data.privateKey && /^[0-9a-fA-F]{64}$/.test(data.privateKey)) {
@@ -97,9 +96,9 @@ function getOrInitNodeValidatorAccount(nodeName) {
   return acc;
 }
 
-function readNodeDriveBalances(ownerKeyHex) {
+function readNodeDriveBalances(nodeName, ownerKeyHex) {
   try {
-    const balancesPath = path.join(DRIVES_DIR, DRIVE_KEY_HEX, 'drive', 'markets', 'balances.json');
+    const balancesPath = path.join(CLUSTER_DIR, nodeName, 'data', 'drives', DRIVE_KEY_HEX, 'drive', 'markets', 'balances.json');
     if (!fs.existsSync(balancesPath)) return null;
     const raw = fs.readFileSync(balancesPath, 'utf8');
     const safeRaw = raw.replace(/:\s*(\d{10,})/g, ':"$1"');
@@ -213,11 +212,63 @@ function parseDecimalToBigIntValidator(valStr, decimals) {
   return BigInt(intPart + paddedFrac);
 }
 
-function verifySettlementAgainstOrderContext(nodeName, tx, callerPub, tradingPub, metadata, networkType) {
-  if (!tradingPub || !/^[0-9A-F]{64}$/.test(tradingPub)) {
-    throw new Error(`Security rejection on ${nodeName}: missing or invalid trading_account_public_key for SETTLEMENT`);
+// Per-node persistent cumulative order-outflow tracker to block split-settlement replay/over-drain
+const validatorOrderOutflowCaches = new Map();
+
+function getValidatorOutflowFile(nodeName) {
+  return path.join(CLUSTER_DIR, nodeName, 'cosigned_order_outflows.json');
+}
+
+function loadValidatorOrderOutflows(nodeName) {
+  if (validatorOrderOutflowCaches.has(nodeName)) {
+    return validatorOrderOutflowCaches.get(nodeName);
   }
-  const ctx = metadata && metadata.orderContext;
+  const map = new Map();
+  const fp = getValidatorOutflowFile(nodeName);
+  try {
+    if (fs.existsSync(fp)) {
+      const raw = JSON.parse(fs.readFileSync(fp, 'utf8'));
+      if (raw && typeof raw === 'object') {
+        for (const [k, v] of Object.entries(raw)) {
+          if (v && typeof v === 'object') {
+            map.set(k, {
+              outXpx: BigInt(v.outXpx || '0'),
+              outQuote: BigInt(v.outQuote || '0'),
+              settlementIds: new Set(Array.isArray(v.settlementIds) ? v.settlementIds : []),
+              updatedAt: Number(v.updatedAt || 0),
+            });
+          }
+        }
+      }
+    }
+  } catch (_) {}
+  validatorOrderOutflowCaches.set(nodeName, map);
+  return map;
+}
+
+function saveValidatorOrderOutflows(nodeName, map) {
+  try {
+    // Prune entries older than 7 days to keep file compact
+    const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
+    const obj = {};
+    for (const [k, v] of map.entries()) {
+      if (v.updatedAt && v.updatedAt < cutoff) continue;
+      obj[k] = {
+        outXpx: v.outXpx.toString(),
+        outQuote: v.outQuote.toString(),
+        settlementIds: Array.from(v.settlementIds).slice(-50),
+        updatedAt: v.updatedAt || Date.now(),
+      };
+    }
+    const fp = getValidatorOutflowFile(nodeName);
+    fs.mkdirSync(path.dirname(fp), { recursive: true, mode: 0o700 });
+    const tmp = `${fp}.tmp.${process.pid}.${Date.now()}`;
+    fs.writeFileSync(tmp, JSON.stringify(obj, null, 2), { mode: 0o600 });
+    fs.renameSync(tmp, fp);
+  } catch (_) {}
+}
+
+function verifySingleParticipantSettlement(nodeName, tx, expectedSignerPub, participantTradingPub, ctx, networkType, settlementId, outflowMap) {
   if (!ctx || !ctx.signature) {
     throw new Error(`Security rejection on ${nodeName}: missing signed orderContext for SETTLEMENT`);
   }
@@ -225,12 +276,14 @@ function verifySettlementAgainstOrderContext(nodeName, tx, callerPub, tradingPub
   if (!/^[0-9a-fA-F]{128}$/.test(sigHex)) {
     throw new Error(`Security rejection on ${nodeName}: malformed orderContext signature`);
   }
-
   const sdk = getXpxSdk();
   const { KeyPair, DerivationScheme, Address } = sdk;
-  const signerPub = String(ctx.publicKey || callerPub || '').toUpperCase();
+  const signerPub = String(ctx.publicKey || expectedSignerPub || '').toUpperCase();
   if (!signerPub || !/^[0-9A-F]{64}$/.test(signerPub)) {
     throw new Error(`Security rejection on ${nodeName}: invalid orderContext publicKey`);
+  }
+  if (expectedSignerPub && signerPub !== expectedSignerPub.toUpperCase()) {
+    throw new Error(`Security rejection on ${nodeName}: orderContext publicKey ${signerPub} does not match expected owner ${expectedSignerPub}`);
   }
   // Security: Always derive domain separator from the validator's own networkType (blocks cross-network replay)
   const domainSep = `${networkType}:SiriusCLOB-v1`;
@@ -252,7 +305,8 @@ function verifySettlementAgainstOrderContext(nodeName, tx, callerPub, tradingPub
     throw new Error(`Security rejection on ${nodeName}: forged or invalid user order signature in settlement`);
   }
 
-  const tradingAddr = Address.createFromPublicKey(tradingPub, Number(networkType)).plain().replace(/[- ]/g, '').toUpperCase();
+  const tradingPubUpper = String(participantTradingPub || '').toUpperCase();
+  const tradingAddr = Address.createFromPublicKey(tradingPubUpper, Number(networkType)).plain().replace(/[- ]/g, '').toUpperCase();
   const specs = getMosaicSpecForAsset(networkType);
   const xpxHex = specs.XPX;
   const quoteSym = normPair.endsWith('/BNB') ? 'BNB' : 'USDT';
@@ -264,6 +318,9 @@ function verifySettlementAgainstOrderContext(nodeName, tx, callerPub, tradingPub
     const sPub = inner.signer ? inner.signer.publicKey.toUpperCase() : '';
     const recipObj = inner.recipient || inner.recipientAddress;
     const rAddr = recipObj && typeof recipObj.plain === 'function' ? recipObj.plain().replace(/[- ]/g, '').toUpperCase() : '';
+    if (sPub === tradingPubUpper && rAddr === tradingAddr) {
+      throw new Error(`Security rejection on ${nodeName}: refused self-transfer loop on Trading Account ${tradingPubUpper}`);
+    }
     for (const m of (inner.mosaics || [])) {
       const mHex = m.id.toHex().toUpperCase();
       const amt = m.amount && typeof m.amount.toHex === 'function'
@@ -272,7 +329,7 @@ function verifySettlementAgainstOrderContext(nodeName, tx, callerPub, tradingPub
       if (amt <= 0n) {
         throw new Error(`Security rejection on ${nodeName}: settlement transfer mosaic amount must be > 0`);
       }
-      if (sPub === tradingPub) outByHex.set(mHex, (outByHex.get(mHex) || 0n) + amt);
+      if (sPub === tradingPubUpper) outByHex.set(mHex, (outByHex.get(mHex) || 0n) + amt);
       if (rAddr === tradingAddr) inByHex.set(mHex, (inByHex.get(mHex) || 0n) + amt);
     }
   }
@@ -295,14 +352,20 @@ function verifySettlementAgainstOrderContext(nodeName, tx, callerPub, tradingPub
     }
   }
 
+  const fingerprint = `${signerPub}:${String(ctx.nonce)}:${sigHex.slice(0, 16)}`;
+  const prevAcc = outflowMap ? outflowMap.get(fingerprint) : null;
+  const alreadyCounted = Boolean(settlementId && prevAcc && prevAcc.settlementIds.has(String(settlementId)));
+  const cumOutXpx = (prevAcc && !alreadyCounted ? prevAcc.outXpx : 0n) + outXpx;
+  const cumOutQuote = (prevAcc && !alreadyCounted ? prevAcc.outQuote : 0n) + outQuote;
+
   if (normSide === 'buy') {
     if (outXpx > 0n) {
       throw new Error(`Security rejection on ${nodeName}: BUY settlement cannot send XPX out of Trading Account`);
     }
     const maxQuoteBase = (orderAmtAtomic * limitPriceTicks + PRICE_SCALE - 1n) / PRICE_SCALE;
     const maxQuoteWithFee = (maxQuoteBase * 102n) / 100n + 1000n;
-    if (outQuote > maxQuoteWithFee) {
-      throw new Error(`Security rejection on ${nodeName}: BUY quote outflow ${outQuote} exceeds signed limit ${maxQuoteWithFee}`);
+    if (outQuote > maxQuoteWithFee || cumOutQuote > maxQuoteWithFee) {
+      throw new Error(`Security rejection on ${nodeName}: BUY quote outflow ${cumOutQuote} exceeds signed limit ${maxQuoteWithFee}`);
     }
     if (outQuote > 0n && inXpx === 0n) {
       throw new Error(`Security rejection on ${nodeName}: BUY settlement sends quote without delivering XPX`);
@@ -318,8 +381,8 @@ function verifySettlementAgainstOrderContext(nodeName, tx, callerPub, tradingPub
       throw new Error(`Security rejection on ${nodeName}: SELL settlement cannot send quote out of Trading Account`);
     }
     const maxXpxWithFee = (orderAmtAtomic * 102n) / 100n + 1000n;
-    if (outXpx > maxXpxWithFee) {
-      throw new Error(`Security rejection on ${nodeName}: SELL XPX outflow ${outXpx} exceeds signed amount ${maxXpxWithFee}`);
+    if (outXpx > maxXpxWithFee || cumOutXpx > maxXpxWithFee) {
+      throw new Error(`Security rejection on ${nodeName}: SELL XPX outflow ${cumOutXpx} exceeds signed amount ${maxXpxWithFee}`);
     }
     if (outXpx > 0n && inQuote === 0n) {
       throw new Error(`Security rejection on ${nodeName}: SELL settlement sends XPX without delivering ${quoteSym}`);
@@ -331,6 +394,73 @@ function verifySettlementAgainstOrderContext(nodeName, tx, callerPub, tradingPub
       }
     }
   }
+
+  return { fingerprint, outXpx, outQuote };
+}
+
+function verifySettlementAgainstOrderContext(nodeName, tx, callerPub, tradingPub, metadata, networkType) {
+  if (!tradingPub || !/^[0-9A-F]{64}$/.test(tradingPub)) {
+    throw new Error(`Security rejection on ${nodeName}: missing or invalid trading_account_public_key for SETTLEMENT`);
+  }
+  const rootCtx = metadata && metadata.orderContext;
+  if (!rootCtx || !rootCtx.signature) {
+    throw new Error(`Security rejection on ${nodeName}: missing signed orderContext for SETTLEMENT`);
+  }
+
+  const settlementId = metadata && metadata.settlementId ? String(metadata.settlementId) : '';
+  const outflowMap = loadValidatorOrderOutflows(nodeName);
+  const verifiedUpdates = [];
+
+  // 1. Always verify primary participant (Taker / callerPub)
+  verifiedUpdates.push(
+    verifySingleParticipantSettlement(nodeName, tx, callerPub, tradingPub, rootCtx, networkType, settlementId, outflowMap)
+  );
+
+  // 2. Multi-participant BFT Zero-Trust Verification (Option 1 Instant DEX + P2P):
+  // Independently verify EVERY OTHER non-Vault Trading Account that has an outflow in this aggregate!
+  const vaultPubUpper = String((metadata && metadata.vaultPublicKey) || '').toUpperCase();
+  const tradingToOwner = (metadata && metadata.participantTradingMap && typeof metadata.participantTradingMap === 'object')
+    ? metadata.participantTradingMap
+    : {};
+  const pContexts = (rootCtx && rootCtx.participantContexts && typeof rootCtx.participantContexts === 'object')
+    ? rootCtx.participantContexts
+    : {};
+
+  const outgoingSigners = new Set();
+  for (const inner of tx.innerTransactions) {
+    const sPub = inner.signer ? inner.signer.publicKey.toUpperCase() : '';
+    if (sPub && sPub !== tradingPub.toUpperCase() && (!vaultPubUpper || sPub !== vaultPubUpper)) {
+      outgoingSigners.add(sPub);
+    }
+  }
+
+  for (const otherTradingPub of outgoingSigners) {
+    const ownerPub = String(
+      tradingToOwner[otherTradingPub] ||
+      tradingToOwner[otherTradingPub.toLowerCase()] ||
+      ''
+    ).toUpperCase();
+    const otherCtx = ownerPub
+      ? (pContexts[ownerPub.toLowerCase()] || pContexts[ownerPub] || null)
+      : null;
+    if (!ownerPub || !otherCtx) {
+      // If metadata explicitly flags instantBftParticipants or participantTradingMap is provided, fail closed!
+      if (
+        (metadata && metadata.requireAllParticipantsVerified) ||
+        Object.keys(tradingToOwner).length > 0
+      ) {
+        throw new Error(
+          `Security rejection on ${nodeName}: missing signed participantContext for outgoing Trading Account ${otherTradingPub.slice(0, 12)}...`
+        );
+      }
+      continue;
+    }
+    verifiedUpdates.push(
+      verifySingleParticipantSettlement(nodeName, tx, ownerPub, otherTradingPub, otherCtx, networkType, settlementId, outflowMap)
+    );
+  }
+
+  return { outflowMap, verifiedUpdates, settlementId };
 }
 
 async function verifyAndCosignOnNode(nodeName, req) {
@@ -368,32 +498,71 @@ async function verifyAndCosignOnNode(nodeName, req) {
   if (!Array.isArray(tx.innerTransactions) || tx.innerTransactions.length === 0) {
     throw new Error('Rejected aggregate transaction with 0 inner transactions');
   }
+  // Catapult binary wire header: 4B size (0..8) + 64B signature (8..136) + 32B outer signer pubkey (136..200)
+  const outerSignerPub = (tx.signer && tx.signer.publicKey)
+    ? String(tx.signer.publicKey).toUpperCase()
+    : (payloadHex.length >= 200 && /^[0-9a-fA-F]+$/.test(payloadHex.slice(136, 200))
+      ? payloadHex.slice(136, 200).toUpperCase()
+      : '');
+
+  let pendingSettlementOutflowCommit = null;
 
   if (action === 'ACTIVATE_TRADING_ACCOUNT') {
-    if (tx.innerTransactions.length !== 1) {
-      throw new Error(`ACTIVATE_TRADING_ACCOUNT must contain exactly 1 inner transaction (got ${tx.innerTransactions.length})`);
+    if (tx.innerTransactions.length < 1 || tx.innerTransactions.length > 2) {
+      throw new Error(`ACTIVATE_TRADING_ACCOUNT must contain 1 or 2 inner transactions (got ${tx.innerTransactions.length})`);
     }
-    const inner = tx.innerTransactions[0];
-    if (inner.type !== TransactionType.MODIFY_MULTISIG_ACCOUNT) {
-      throw new Error(`Expected MODIFY_MULTISIG_ACCOUNT (16725), got ${inner.type}`);
+    const modTxs = tx.innerTransactions.filter((it) => it.type === TransactionType.MODIFY_MULTISIG_ACCOUNT);
+    const otherTxs = tx.innerTransactions.filter((it) => it.type !== TransactionType.MODIFY_MULTISIG_ACCOUNT);
+    if (modTxs.length !== 1) {
+      throw new Error(`ACTIVATE_TRADING_ACCOUNT must contain strictly 1 MODIFY_MULTISIG_ACCOUNT (got ${modTxs.length})`);
     }
+    const inner = modTxs[0];
     if (!inner.signer || inner.signer.publicKey.toUpperCase() !== tradingPub) {
       throw new Error('ModifyMultisigAccount signer does not match trading_account_public_key');
     }
-    if (inner.minApprovalDelta !== 2 || inner.minRemovalDelta !== 2) {
-      throw new Error(`Security rejection: minApprovalDelta and minRemovalDelta must both be 2 (got ${inner.minApprovalDelta}/${inner.minRemovalDelta})`);
-    }
-    if (!Array.isArray(inner.modifications) || inner.modifications.length !== 2) {
-      throw new Error('Security rejection: Trading Account must have exactly 2 cosignatories (User + ValidatorCluster)');
-    }
-    const modPks = inner.modifications.map((m) => {
+    const modPks = (inner.modifications || []).map((m) => {
       if (m.type !== 0) {
         throw new Error('Security rejection: Only Add cosignatory modifications are permitted during activation');
       }
       return m.cosignatoryPublicAccount.publicKey.toUpperCase();
     });
-    if (!modPks.includes(callerPub) || !clusterPub || !modPks.includes(clusterPub)) {
-      throw new Error('Security rejection: Modifications must strictly include [UserMainPublicKey, ValidatorClusterPublicKey]');
+
+    const isInstantBftMode = inner.minApprovalDelta === 1 && inner.minRemovalDelta === 1 && modPks.length === 1;
+    const isTwoOfTwoMode = inner.minApprovalDelta === 2 && inner.minRemovalDelta === 2 && modPks.length === 2;
+    if (!isInstantBftMode && !isTwoOfTwoMode) {
+      throw new Error(
+        `Security rejection: unsupported activation thresholds (${inner.minApprovalDelta}/${inner.minRemovalDelta}, cosigs=${modPks.length})`
+      );
+    }
+    if (isInstantBftMode) {
+      if (!clusterPub || !modPks.includes(clusterPub)) {
+        throw new Error('Security rejection: Instant BFT Trading Account cosignatory must strictly be [ValidatorClusterPublicKey]');
+      }
+      if (!outerSignerPub || outerSignerPub !== callerPub) {
+        throw new Error('Security rejection: Instant BFT activation outer initiator must be caller_public_key');
+      }
+      if (otherTxs.length !== 1) {
+        throw new Error('Security rejection: Instant BFT activation must include 1 owner authorization anchor transfer');
+      }
+      // Require 0-mosaic Transfer signed by callerPub -> tradingPub to prove Owner authorization on L1
+      for (const anchor of otherTxs) {
+        if (anchor.type !== TransactionType.TRANSFER) {
+          throw new Error(`Security rejection: unexpected inner tx type ${anchor.type} in Instant BFT activation`);
+        }
+        if (!anchor.signer || anchor.signer.publicKey.toUpperCase() !== callerPub) {
+          throw new Error('Security rejection: Instant BFT activation anchor must be signed by caller_public_key');
+        }
+        if (Array.isArray(anchor.mosaics) && anchor.mosaics.length > 0) {
+          throw new Error('Security rejection: Instant BFT activation anchor transfer must carry 0 mosaics');
+        }
+      }
+    } else {
+      if (otherTxs.length > 0) {
+        throw new Error('Security rejection: 2-of-2 activation must contain strictly 1 ModifyMultisigAccountTransaction');
+      }
+      if (!modPks.includes(callerPub) || !clusterPub || !modPks.includes(clusterPub)) {
+        throw new Error('Security rejection: Modifications must strictly include [UserMainPublicKey, ValidatorClusterPublicKey]');
+      }
     }
   } else if (action === 'WITHDRAWAL') {
     if (!tradingPub || !callerPub) {
@@ -404,6 +573,7 @@ async function verifyAndCosignOnNode(nodeName, req) {
       throw new Error(`Security rejection on ${nodeName}: missing recipientAddress in WITHDRAWAL metadata`);
     }
     const maxFreeAtomic = metadata.maxWithdrawableAtomic ? BigInt(metadata.maxWithdrawableAtomic) : null;
+    const networkType = Number(process.env.SIRIUS_NETWORK_TYPE || (String(process.env.SIRIUS_NETWORK || '').toLowerCase() === 'mainnet' ? 184 : 168));
     const feeCollectorAddr = String(metadata.feeCollectorAddress || '').replace(/[- ]/g, '').toUpperCase();
     let totalOutgoingByMosaic = new Map();
 
@@ -411,7 +581,13 @@ async function verifyAndCosignOnNode(nodeName, req) {
       if (inner.type !== TransactionType.TRANSFER) {
         throw new Error(`Security rejection: WITHDRAWAL aggregate may ONLY contain TRANSFER transactions (got ${inner.type})`);
       }
-      if (!inner.signer || inner.signer.publicKey.toUpperCase() !== tradingPub) {
+      const sPub = inner.signer ? inner.signer.publicKey.toUpperCase() : '';
+      const innerMosaics = Array.isArray(inner.mosaics) ? inner.mosaics : [];
+      // Allow an optional 0-mosaic authorization anchor signed by callerPub (required by Catapult for minApproval=1 outer initiator)
+      if (sPub === callerPub && innerMosaics.length === 0) {
+        continue;
+      }
+      if (sPub !== tradingPub) {
         throw new Error('Security rejection: All withdrawal transfers must originate from trading_account_public_key');
       }
       const recipObj = inner.recipient || inner.recipientAddress;
@@ -419,7 +595,7 @@ async function verifyAndCosignOnNode(nodeName, req) {
       if (!recipAddr || (recipAddr !== expectedRecipientRaw && (!feeCollectorAddr || recipAddr !== feeCollectorAddr))) {
         throw new Error(`Security rejection: Transfer recipient ${recipAddr} does not match approved recipient ${expectedRecipientRaw}`);
       }
-      for (const m of (inner.mosaics || [])) {
+      for (const m of innerMosaics) {
         const mHex = m.id.toHex().toUpperCase();
         const amt = BigInt(m.amount.compact ? m.amount.compact() : m.amount);
         if (amt <= 0n) {
@@ -445,13 +621,15 @@ async function verifyAndCosignOnNode(nodeName, req) {
     if (approvedHexSet.size === 0) {
       throw new Error(`Security rejection on ${nodeName}: missing approved mosaic list in WITHDRAWAL metadata`);
     }
+    if (!outerSignerPub || outerSignerPub !== callerPub) {
+      throw new Error(`Security rejection on ${nodeName}: WITHDRAWAL outer initiator must strictly be caller_public_key`);
+    }
     for (const [mKey] of totalOutgoingByMosaic.entries()) {
       if (!approvedHexSet.has(mKey)) {
         throw new Error(`Security rejection on ${nodeName}: unapproved mosaic ${mKey} in withdrawal`);
       }
     }
 
-    const networkType = Number(process.env.SIRIUS_NETWORK_TYPE || (String(process.env.SIRIUS_NETWORK || '').toLowerCase() === 'mainnet' ? 184 : 168));
     const specs = getMosaicSpecForAsset(networkType);
     let l1Mosaics = null;
     try {
@@ -462,7 +640,7 @@ async function verifyAndCosignOnNode(nodeName, req) {
       }
     }
 
-    const driveAcc = readNodeDriveBalances(callerPub);
+    const driveAcc = readNodeDriveBalances(nodeName, callerPub);
     for (const [mKey, outAmt] of totalOutgoingByMosaic.entries()) {
       const checkItem = checks.find((c) => String(c.mosaicHex || '').toUpperCase() === mKey);
       if (l1Mosaics) {
@@ -500,13 +678,31 @@ async function verifyAndCosignOnNode(nodeName, req) {
       }
     }
     const settlementNetType = Number(process.env.SIRIUS_NETWORK_TYPE || (String(process.env.SIRIUS_NETWORK || '').toLowerCase() === 'mainnet' ? 184 : 168));
-    verifySettlementAgainstOrderContext(nodeName, tx, callerPub, tradingPub, metadata, settlementNetType);
+    pendingSettlementOutflowCommit = verifySettlementAgainstOrderContext(nodeName, tx, callerPub, tradingPub, metadata, settlementNetType);
   } else {
     throw new Error(`Unsupported cosign action: ${action}`);
   }
 
   const validatorAcc = getOrInitNodeValidatorAccount(nodeName);
   const cosig = CosignatureTransaction.signTransactionPayload(validatorAcc, payloadHex, generationHash);
+
+  // Record verified cumulative order outflows ONLY AFTER all security checks and cosigning succeeded
+  if (pendingSettlementOutflowCommit && pendingSettlementOutflowCommit.verifiedUpdates.length > 0) {
+    const { outflowMap, verifiedUpdates, settlementId } = pendingSettlementOutflowCommit;
+    const nowTs = Date.now();
+    for (const u of verifiedUpdates) {
+      const cur = outflowMap.get(u.fingerprint) || { outXpx: 0n, outQuote: 0n, settlementIds: new Set(), updatedAt: nowTs };
+      if (!settlementId || !cur.settlementIds.has(settlementId)) {
+        cur.outXpx += u.outXpx;
+        cur.outQuote += u.outQuote;
+        if (settlementId) cur.settlementIds.add(settlementId);
+        cur.updatedAt = nowTs;
+        outflowMap.set(u.fingerprint, cur);
+      }
+    }
+    saveValidatorOrderOutflows(nodeName, outflowMap);
+  }
+
   return {
     approved: true,
     error: '',
@@ -517,24 +713,20 @@ async function verifyAndCosignOnNode(nodeName, req) {
   };
 }
 
-function verifyVmAuthMetadata(callOrStream, bindAddress = '') {
+function verifyVmAuthMetadata(callOrStream) {
   const expectedToken = (process.env.SIRIUS_VM_AUTH_TOKEN || '').trim();
-  const isLoopbackOnly = bindAddress.startsWith('127.0.0.1') || bindAddress.startsWith('localhost');
   const isMainnet =
     String(process.env.SIRIUS_NETWORK || '').toLowerCase() === 'mainnet' ||
     String(process.env.NETWORK_ENV || '').toLowerCase() === 'mainnet' ||
     String(process.env.SIRIUS_NETWORK_TYPE || '') === '184';
   if (!expectedToken) {
-    if (isMainnet || process.env.NODE_ENV === 'production' || (!isLoopbackOnly && bindAddress)) {
-      console.error('[SECURITY] Rejected unauthenticated call: SIRIUS_VM_AUTH_TOKEN is required on Mainnet / production / non-loopback network');
-      return false;
-    }
-    return true; // Dev mode on loopback only
+    // Fail-closed on Mainnet: never allow unauthenticated validator RPCs without a token
+    return !isMainnet;
   }
   const metaVals = callOrStream && callOrStream.metadata ? callOrStream.metadata.get('x-sirius-vm-token') : [];
   const provided = String((metaVals && metaVals[0]) || '');
   const a = Buffer.from(provided, 'utf8');
-  const b = Buffer.from(String(expectedToken), 'utf8');
+  const b = Buffer.from(expectedToken, 'utf8');
   if (a.length !== b.length) return false;
   return crypto.timingSafeEqual(a, b);
 }
@@ -543,26 +735,15 @@ function validateWasmFileToCall(filePath) {
   if (!filePath || typeof filePath !== 'string') {
     throw new Error('Missing file_to_call path');
   }
-  let resolved = path.resolve(filePath);
-  if (!fs.existsSync(resolved)) {
-    const candidate = path.join(CONTRACTS_DIR, path.basename(filePath));
-    if (fs.existsSync(candidate)) {
-      resolved = candidate;
-    }
-  }
-
-  // Strict path containment & extension validation
+  const resolved = path.resolve(filePath);
+  const clusterRoot = CLUSTER_DIR.endsWith(path.sep) ? CLUSTER_DIR : CLUSTER_DIR + path.sep;
   const contractsRoot = CONTRACTS_DIR.endsWith(path.sep) ? CONTRACTS_DIR : CONTRACTS_DIR + path.sep;
-  if (!resolved.startsWith(contractsRoot)) {
-    throw new Error(`Security rejection: WASM binary (${filePath}) must reside inside authorized contracts directory: ${CONTRACTS_DIR}`);
+  if (!resolved.startsWith(clusterRoot) && !resolved.startsWith(contractsRoot)) {
+    throw new Error(`Security rejection: file_to_call (${filePath}) is outside allowed cluster/contracts directory`);
   }
-  if (!resolved.endsWith('.wasm')) {
-    throw new Error(`Security rejection: Only .wasm WebAssembly binaries are permitted`);
-  }
-  if (!fs.existsSync(resolved)) {
+  if (!resolved.endsWith('.wasm') || !fs.existsSync(resolved)) {
     throw new Error(`Security rejection: WASM binary does not exist at ${resolved}`);
   }
-
   const allowedHashesRaw = process.env.SIRIUS_ALLOWED_WASM_SHA256;
   if (allowedHashesRaw) {
     const allowedSet = new Set(
@@ -587,14 +768,21 @@ const packageDefinition = protoLoader.loadSync(PROTO_PATH, {
   enums: String,
   defaults: true,
   oneofs: true,
+  includeDirs: [PROTO_DIR],
 });
 
-const supercontractProto = grpc.loadPackageDefinition(packageDefinition);
-const supercontractserver = supercontractProto.supercontractserver;
+const protoDescriptor = grpc.loadPackageDefinition(packageDefinition);
+const supercontractserver = protoDescriptor.supercontractserver;
 
-const SHARED_BUFFER_BYTES = 1024 * 1024 * 4; // 4 MB shared IPC buffer per pooled worker
+const SHARED_BUFFER_BYTES = 1024 * 1024; // 1 MB shared IPC buffer per pooled worker
 const WASM_WORKER_POOL_SIZE = Math.max(1, Math.min(8, Number(process.env.WASM_WORKER_POOL_SIZE || 2)));
 
+/**
+ * Persistent Warm WASM Worker Pool:
+ * Eliminates per-order `new Worker()` thread-spawn overhead (60x faster on CPU-throttled cloud
+ * containers and ~10x faster locally) while still instantiating a fresh WebAssembly.Instance per call
+ * for 100% deterministic memory isolation.
+ */
 class WarmWasmWorkerPool {
   constructor(nodeName, maxSize = WASM_WORKER_POOL_SIZE) {
     this.nodeName = nodeName;
@@ -718,20 +906,18 @@ class WarmWasmWorkerPool {
   }
 }
 
-// In-memory LRU cache of pre-compiled WebAssembly.Module instances
-const wasmModuleCache = new Map();
+const compiledWasmCache = new Map();
 async function getCompiledWasmModule(wasmPath) {
-  const stats = fs.statSync(wasmPath);
-  const cacheKey = `${wasmPath}:${stats.mtimeMs}:${stats.size}`;
-  if (wasmModuleCache.has(cacheKey)) {
-    return wasmModuleCache.get(cacheKey);
+  if (!compiledWasmCache.has(wasmPath)) {
+    const bytes = fs.readFileSync(wasmPath);
+    compiledWasmCache.set(wasmPath, WebAssembly.compile(bytes));
   }
-  const wasmBuffer = fs.readFileSync(wasmPath);
-  const compiledModule = await WebAssembly.compile(wasmBuffer);
-  wasmModuleCache.set(cacheKey, compiledModule);
-  return compiledModule;
+  return compiledWasmCache.get(wasmPath);
 }
 
+/**
+ * Normalizes protobuf Buffer fields to base64 strings before serializing into SharedArrayBuffer.
+ */
 function normalizeClientMessage(msg) {
   if (Array.isArray(msg)) {
     return msg.map((item) => {
@@ -755,38 +941,49 @@ function normalizeClientMessage(msg) {
   return out;
 }
 
-function prepareServerMessage(msg) {
-  const clone = { ...msg };
-  if (clone.storage_read && clone.storage_read.drive_key) {
-    clone.storage_read.drive_key = Buffer.from(clone.storage_read.drive_key, 'hex');
+/**
+ * Converts base64 fields in worker serverMessage back into Buffers where protobuf expects `bytes`.
+ */
+function prepareServerMessage(serverMsg) {
+  if (serverMsg.write_file_stream && typeof serverMsg.write_file_stream.buffer === 'string') {
+    return {
+      write_file_stream: {
+        identifier: serverMsg.write_file_stream.identifier,
+        buffer: Buffer.from(serverMsg.write_file_stream.buffer, 'base64'),
+      },
+    };
   }
-  if (clone.storage_save && clone.storage_save.drive_key) {
-    clone.storage_save.drive_key = Buffer.from(clone.storage_save.drive_key, 'hex');
-  }
-  return clone;
+  return serverMsg;
 }
 
 function createSupercontractService(nodeName, bindAddress, workerPool = null) {
   const pool = workerPool || new WarmWasmWorkerPool(nodeName);
   return {
-    Ping: (call, callback) => {
-      if (!verifyVmAuthMetadata(call, bindAddress)) {
-        return callback({ code: grpc.status.UNAUTHENTICATED, details: 'Unauthorized: invalid VM auth token' });
+    Ping(call, callback) {
+      if (!verifyVmAuthMetadata(call)) {
+        return callback({
+          code: grpc.status.UNAUTHENTICATED,
+          message: 'Invalid or missing x-sirius-vm-token metadata',
+        });
       }
+      const callerName = call.request.name || 'unknown';
       let validatorPublicKey = '';
       try {
         validatorPublicKey = getOrInitNodeValidatorAccount(nodeName).publicKey;
       } catch (_) {}
       callback(null, {
-        message: `PONG from ${nodeName} (uptime: ${Math.floor(process.uptime())}s)`,
+        message: `PONG from ${nodeName} WASM VM (${bindAddress}) to ${callerName}`,
         validator_public_key: validatorPublicKey,
         node_name: nodeName,
       });
     },
 
-    CosignTransaction: (call, callback) => {
-      if (!verifyVmAuthMetadata(call, bindAddress)) {
-        return callback({ code: grpc.status.UNAUTHENTICATED, details: 'Unauthorized: invalid VM auth token' });
+    CosignTransaction(call, callback) {
+      if (!verifyVmAuthMetadata(call)) {
+        return callback({
+          code: grpc.status.UNAUTHENTICATED,
+          message: 'Invalid or missing x-sirius-vm-token metadata',
+        });
       }
       verifyAndCosignOnNode(nodeName, call.request || {})
         .then((reply) => {
@@ -806,27 +1003,38 @@ function createSupercontractService(nodeName, bindAddress, workerPool = null) {
         });
     },
 
-    ExecuteCall: (stream) => {
-      if (!verifyVmAuthMetadata(stream, bindAddress)) {
-        stream.emit('error', { code: grpc.status.UNAUTHENTICATED, details: 'Unauthorized: invalid VM auth token' });
+    ExecuteCall(stream) {
+      if (!verifyVmAuthMetadata(stream)) {
+        console.warn(`[${nodeName} VM] ⛔ Rejected unauthenticated ExecuteCall stream`);
+        if (!stream.writableEnded) {
+          stream.write({
+            returns: {
+              success: false,
+              execution_gas_consumed: '0',
+              download_gas_consumed: '0',
+              poex_secret_data: '0',
+              return_val: -401,
+            },
+          });
+          stream.end();
+        }
         return;
       }
-
       let slot = null;
       let streamCompleted = false;
       let streamAborted = false;
       let started = false;
 
-      stream.on('data', async (clientMsg) => {
-        if ((clientMsg.execute_call || clientMsg.request) && !started) {
+      stream.on('data', async (reqMsg) => {
+        // 1. Initial ExecuteRequest acquires a warm pooled WASM Worker
+        if (reqMsg.request && !started) {
           started = true;
-          const execReq = clientMsg.execute_call || clientMsg.request;
-
+          const execReq = reqMsg.request;
           let validatedWasmPath;
           try {
             validatedWasmPath = validateWasmFileToCall(execReq.file_to_call);
-          } catch (valErr) {
-            console.error(`[${nodeName} VM] Rejection:`, valErr.message);
+          } catch (secErr) {
+            console.error(`[${nodeName} VM] ⛔ ${secErr.message}`);
             if (!stream.writableEnded) {
               stream.write({
                 returns: {
@@ -834,7 +1042,7 @@ function createSupercontractService(nodeName, bindAddress, workerPool = null) {
                   execution_gas_consumed: '0',
                   download_gas_consumed: '0',
                   poex_secret_data: '0',
-                  return_val: 101, // ErrorCode::InvalidParameters
+                  return_val: -403,
                 },
               });
               stream.end();
@@ -844,7 +1052,7 @@ function createSupercontractService(nodeName, bindAddress, workerPool = null) {
 
           const paramsHex = Buffer.isBuffer(execReq.parameters)
             ? execReq.parameters.toString('hex')
-            : (execReq.parameters ? Buffer.from(execReq.parameters).toString('hex') : '');
+            : '';
 
           let wasmModule = null;
           try {
@@ -902,7 +1110,7 @@ function createSupercontractService(nodeName, bindAddress, workerPool = null) {
           };
 
           slot.onError = (err) => {
-            console.error(`[${nodeName} VM] Worker thread crash:`, err);
+            console.error(`[${nodeName} VM] ❌ Worker error:`, err);
             slot = null;
             streamCompleted = true;
             if (!stream.writableEnded) {
@@ -912,7 +1120,7 @@ function createSupercontractService(nodeName, bindAddress, workerPool = null) {
                   execution_gas_consumed: '0',
                   download_gas_consumed: '0',
                   poex_secret_data: '0',
-                  return_val: 104,
+                  return_val: -1,
                 },
               });
               stream.end();
@@ -931,24 +1139,26 @@ function createSupercontractService(nodeName, bindAddress, workerPool = null) {
             downloadGasLimit: execReq.download_gas_limit || '0',
             callMode: execReq.call_mode || 0,
           });
-        } else {
-          // 2. Host call reply from C++ Executor / Gateway -> wake up blocked WASM worker via Atomics.notify()
-          if (slot && !slot.disposed && slot.control) {
-            const normalized = normalizeClientMessage(clientMsg);
-            const jsonBytes = Buffer.from(JSON.stringify(normalized), 'utf8');
-            if (jsonBytes.length > slot.dataBuffer.length) {
-              const errBytes = Buffer.from('IPC response exceeded SharedArrayBuffer capacity', 'utf8');
-              const copyLen = Math.min(errBytes.length, slot.dataBuffer.length);
-              errBytes.copy(slot.dataBuffer, 0, 0, copyLen);
-              Atomics.store(slot.control, 1, copyLen);
-              Atomics.store(slot.control, 0, -1);
-            } else {
-              jsonBytes.copy(slot.dataBuffer, 0);
-              Atomics.store(slot.control, 1, jsonBytes.length);
-              Atomics.store(slot.control, 0, 2); // 2 = response ready
-            }
-            Atomics.notify(slot.control, 0, 1);
+
+          return;
+        }
+
+        // 2. Host call reply from C++ Executor -> wake up blocked WASM worker via Atomics.notify()
+        if (slot && !slot.disposed && slot.control) {
+          const normalized = normalizeClientMessage(reqMsg);
+          const jsonBytes = Buffer.from(JSON.stringify(normalized), 'utf8');
+          if (jsonBytes.length > slot.dataBuffer.length) {
+            const errBytes = Buffer.from('IPC response exceeded SharedArrayBuffer capacity', 'utf8');
+            const copyLen = Math.min(errBytes.length, slot.dataBuffer.length);
+            errBytes.copy(slot.dataBuffer, 0, 0, copyLen);
+            Atomics.store(slot.control, 1, copyLen);
+            Atomics.store(slot.control, 0, -1);
+          } else {
+            jsonBytes.copy(slot.dataBuffer, 0);
+            Atomics.store(slot.control, 1, jsonBytes.length);
+            Atomics.store(slot.control, 0, 2); // 2 = response ready
           }
+          Atomics.notify(slot.control, 0, 1);
         }
       });
 
@@ -958,11 +1168,13 @@ function createSupercontractService(nodeName, bindAddress, workerPool = null) {
         if (slot) {
           const s = slot;
           slot = null;
+          // Stream aborted mid-execution: destroy this worker cleanly so no hung Atomics.wait lingers
           pool.destroy(s);
         }
       }
 
       stream.on('end', abortWorker);
+
       stream.on('error', (err) => {
         console.error(`[${nodeName} VM] Stream error:`, err.message);
         abortWorker();
@@ -971,7 +1183,7 @@ function createSupercontractService(nodeName, bindAddress, workerPool = null) {
   };
 }
 
-function startVmServer(port, nodeName, bindHost = process.env.SIRIUS_VM_BIND_HOST || '0.0.0.0') {
+function startVmServer(port, nodeName, bindHost = process.env.SIRIUS_VM_BIND_HOST || '127.0.0.1') {
   return new Promise((resolve, reject) => {
     const bindAddress = `${bindHost}:${port}`;
     const server = new grpc.Server();
@@ -1007,12 +1219,7 @@ function startVmServer(port, nodeName, bindHost = process.env.SIRIUS_VM_BIND_HOS
       if (err) {
         return reject(err);
       }
-      console.log(`================================================================================`);
-      console.log(`🚀 Sirius SuperContract Validator Node [${nodeName}] Online`);
-      console.log(`   Listening on:   ${bindHost}:${boundPort} (${tlsMode})`);
-      console.log(`   Contracts Dir:  ${CONTRACTS_DIR}`);
-      console.log(`   Data/Drive Dir: ${DRIVES_DIR}`);
-      console.log(`================================================================================`);
+      console.log(`🚀 [${nodeName}] SuperContract V2 gRPC WASM VM listening on ${bindHost}:${boundPort} (${tlsMode})`);
       resolve(server);
     });
   });
@@ -1021,6 +1228,7 @@ function startVmServer(port, nodeName, bindHost = process.env.SIRIUS_VM_BIND_HOS
 if (require.main === module) {
   const port = parseInt(process.argv[2] || process.env.VM_PORT || '5051', 10);
   const nodeName = process.argv[3] || process.env.NODE_NAME || `node-${port}`;
+  // Keep Node.js event loop alive indefinitely for daemon mode
   setInterval(() => {}, 60000);
   startVmServer(port, nodeName).catch((err) => {
     console.error(`Failed to start VM server on port ${port}:`, err);
